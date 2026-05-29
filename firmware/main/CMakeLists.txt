@@ -1,0 +1,21 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "audio_pipeline.c"
+        "codec_lc3.c"
+        "mesh_mac.c"
+        "mixer.c"
+        "bt_classic.c"
+        "session_fsm.c"
+        "ui.c"
+        "nvs_cfg.c"
+        "coex.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        nvs_flash
+        esp_wifi
+        esp_now
+        bt
+        driver
+        esp_event
+)
