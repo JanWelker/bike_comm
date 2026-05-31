@@ -14,8 +14,9 @@ idf_component_register(
     REQUIRES
         nvs_flash
         esp_wifi
-        esp_now
+        esp_coex
         bt
         driver
         esp_event
+        esp_timer
 )

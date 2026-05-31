@@ -18,7 +18,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the design. The full plan
 
 ## Firmware
 
-- ESP-IDF v5.x, FreeRTOS.
+- ESP-IDF v5.5, FreeRTOS.
 - ESP-ADF for audio pipeline, ESP-SR for AEC/NS/VAD.
 - Bluedroid for BT Classic (HFP-HF + A2DP-sink).
 - Custom TDMA MAC over ESP-NOW for the mesh; google/liblc3 for the codec.

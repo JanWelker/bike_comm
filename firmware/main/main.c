@@ -68,7 +68,7 @@ void app_main(void)
     ESP_LOGI(TAG, "bike_comm starting (chip: ESP32 single-chip path)");
 
     platform_init();
-    coex_init();
+    app_coex_init();
 
     ESP_ERROR_CHECK(nvs_cfg_init());
     ESP_ERROR_CHECK(audio_pipeline_init());

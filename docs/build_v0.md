@@ -8,7 +8,7 @@ Goal: two ESP32-LyraT-Mini boards talking voice over ESP-NOW. No phone, no PCB.
   - 2 are used in v0 (two-way voice). The other 2 unlock v0.5 mesh-protocol tests without a second order, and give us a spare for RF-range bench work (one board at an attenuator) and a known-good comparison node when something misbehaves. Two-node tests can't surface the interesting bugs in TDMA (slot arbitration, coordinator failover, multi-source jitter).
 - 4× wired earbud headsets with mic (3.5 mm TRRS).
 - 4× USB cables matching the LyraT-Mini connector (verify on the product listing — likely Micro-USB, possibly USB-C on newer revs). The laptop only flashes one at a time, but it's nicer to leave each board cabled to its own power source during multi-node tests.
-- A Mac (you're already there) with ESP-IDF v5.x installed.
+- A Mac (you're already there) with ESP-IDF v5.5 installed.
 
 ## ESP-IDF setup
 
@@ -16,7 +16,7 @@ Goal: two ESP32-LyraT-Mini boards talking voice over ESP-NOW. No phone, no PCB.
 # One-time install
 brew install cmake ninja dfu-util python@3.12 ccache
 mkdir -p ~/esp && cd ~/esp
-git clone --recursive https://github.com/espressif/esp-idf.git -b v5.3
+git clone --recursive --depth 1 -b v5.5.4 https://github.com/espressif/esp-idf.git
 cd esp-idf && ./install.sh esp32
 
 # Each shell

@@ -13,7 +13,7 @@
 
 static const char *TAG = "coex";
 
-void coex_init(void)
+void app_coex_init(void)
 {
     ESP_LOGI(TAG, "init (balanced)");
     esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);

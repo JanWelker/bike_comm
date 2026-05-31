@@ -12,7 +12,9 @@
 
 #pragma once
 
-void coex_init(void);
+/* Renamed from coex_init to avoid collision with Espressif's internal
+ * coex_init symbol in libcoexist.a. */
+void app_coex_init(void);
 
 /* Bias the coex arbiter when a call/SCO is active. */
 void coex_prefer_bt_call(void);

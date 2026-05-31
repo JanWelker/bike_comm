@@ -40,6 +40,10 @@ CONFIG_SW_COEXIST_ENABLE=y
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
+# Flash size — WROVER-E modules ship with 4 MB
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
 # Partition table — custom (OTA-ready, room for ESP-SR models in PSRAM-backed flash)
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
