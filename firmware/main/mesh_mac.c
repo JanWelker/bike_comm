@@ -168,12 +168,12 @@ esp_err_t mesh_mac_init(const uint8_t group_psk[16])
 
     /* Add broadcast peer.
      *
-     * NOTE: docs/mesh_protocol.md asserts ESP-NOW AES-128-CCM protects
-     * group traffic, but ESP-NOW does NOT encrypt broadcast — only
-     * unicast unicast-with-encrypt=true. For v0 we ship unencrypted
-     * broadcast; if/when we need confidentiality we'll either switch to
-     * N unicast peers (8 × 90 B = fine within MTU) or layer our own
-     * AES-CCM on the payload. TODO(v0.5). */
+     * v0 ships unencrypted on the wire — ESP-NOW only applies AES-128-CCM
+     * to unicast peers with encrypt=true; broadcast is plaintext. We
+     * still install the PSK above so we don't re-architect when we add
+     * encryption. See docs/mesh_protocol.md "Security" for the two
+     * options (app-layer CCM vs. unicast-with-CCM) and the decision
+     * gate (before any public/field deployment, well before v1). */
     esp_now_peer_info_t peer = {0};
     memcpy(peer.peer_addr, BROADCAST_MAC, 6);
     peer.channel = 0;          /* current channel */
