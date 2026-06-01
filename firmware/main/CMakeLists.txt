@@ -4,7 +4,9 @@ idf_component_register(
         "audio_pipeline.c"
         "codec_lc3.c"
         "mesh_mac.c"
+        "mesh_proto.c"
         "mixer.c"
+        "mixer_jb.c"
         "bt_classic.c"
         "session_fsm.c"
         "ui.c"
@@ -19,4 +21,5 @@ idf_component_register(
         driver
         esp_event
         esp_timer
+        liblc3
 )

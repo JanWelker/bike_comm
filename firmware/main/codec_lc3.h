@@ -18,7 +18,9 @@
 
 #define LC3_BITRATE_BPS    24000
 #define LC3_FRAME_DUR_US   10000
+#define LC3_SAMPLE_RATE_HZ 16000
 #define LC3_FRAME_BYTES    30        /* derived from bitrate and frame duration */
+#define LC3_PCM_SAMPLES    160       /* 10 ms @ 16 kHz */
 #define LC3_MAX_DECODERS   8         /* one per rider in an 8-rider mesh */
 
 esp_err_t codec_lc3_init(void);
