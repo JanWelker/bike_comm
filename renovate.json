@@ -1,0 +1,61 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommitTypeAll(deps)"
+  ],
+  "labels": ["dependencies"],
+  "timezone": "Europe/Zurich",
+  "schedule": ["before 4am on monday"],
+  "minimumReleaseAge": "7 days",
+  "prHourlyLimit": 4,
+  "prConcurrentLimit": 8,
+  "automerge": false,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "ESP-IDF git tag pinned in the v0 bring-up guide",
+      "managerFilePatterns": ["/^docs/build_v0\\.md$/"],
+      "matchStrings": [
+        "git clone .*? -b (?<currentValue>v[0-9.]+) https://github\\.com/espressif/esp-idf\\.git"
+      ],
+      "depNameTemplate": "espressif/esp-idf",
+      "datasourceTemplate": "github-tags",
+      "extractVersionTemplate": "^(?<version>v[0-9.]+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "liblc3 git tag pinned in the vendoring notes",
+      "managerFilePatterns": [
+        "/^firmware/components/liblc3/VENDORING\\.md$/"
+      ],
+      "matchStrings": [
+        "liblc3 \\*\\*(?<currentValue>v[0-9.]+)\\*\\*",
+        "google/liblc3\\.git (?<currentValue>v[0-9.]+) --squash"
+      ],
+      "depNameTemplate": "google/liblc3",
+      "datasourceTemplate": "github-tags"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "ESP-IDF bumps need a re-flash and may shift APIs; review carefully.",
+      "matchDepNames": ["espressif/esp-idf"],
+      "addLabels": ["esp-idf"],
+      "groupName": "ESP-IDF"
+    },
+    {
+      "description": "liblc3 bumps need a codec wrapper review + roundtrip retest.",
+      "matchDepNames": ["google/liblc3"],
+      "addLabels": ["liblc3"],
+      "groupName": "liblc3"
+    },
+    {
+      "description": "Major bumps always go through the dashboard for explicit approval.",
+      "matchUpdateTypes": ["major"],
+      "addLabels": ["major-bump"],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}
