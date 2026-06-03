@@ -232,13 +232,14 @@ void audio_pipeline_start(void)
     ESP_LOGI(TAG, "PA enable high");
 
     s_running = true;
-    /* 4 KB was OK for plain mic->spk loopback; with codec_lc3_encode +
-     * mesh_mac_queue_tx + mixer_pull + drain in the hot path we need
-     * more headroom or the task overflows and corrupts core 0 via
-     * the cross-core mutex. 6 KB is comfortable AND leaves enough
-     * internal RAM for mesh_tx_task + audio_rx work afterwards. */
+    /* 4 KB overflows once LC3 encode + cross-core mesh mutex enter the
+     * hot path (Guru Meditation on core 0 via the cross-core mutex).
+     * 6 KB survives queue_tx + drain. mixer_pull (LC3 decode + 160-
+     * sample int32 accumulator + per-rider PCM buffer) needs more —
+     * trying 7 KB. 8 KB is the upper bound that still leaves enough
+     * internal RAM for mesh_tx_task to be created afterwards. */
     BaseType_t ok = xTaskCreatePinnedToCore(loopback_task, "audio_loopback",
-                                            6144, NULL, LOOPBACK_TASK_PRIO,
+                                            7168, NULL, LOOPBACK_TASK_PRIO,
                                             NULL, AUDIO_CORE);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "loopback task create failed");
@@ -552,19 +553,7 @@ static void loopback_task(void *arg)
         mesh_mac_queue_tx(lc3_buf, /*vad_active=*/true);
         mesh_rx_drain_to_mixer();
 
-        /* v0 playback: self-loopback (mic to own speaker). Enabling
-         * `mixer_pull(spk_buf, aec_ref)` here regresses the mesh on
-         * the joiner (coordinator-lost within ~100 ms) AND occasionally
-         * crashes the coordinator with a wild-PC Guru Meditation on
-         * core 0 — best guess is that mixer_pull's LC3-decode hot loop
-         * on core 1 starves wifi RX on core 0 just enough to drop
-         * beacons. TX + drain into the mixer is healthy (see the
-         * `rx drain` log climbing at ~50 fps on the coordinator), so
-         * remote frames ARE flowing into the JB — we just don't play
-         * them back yet. Re-enabling this block is the next focused
-         * piece of work. */
-        memcpy(spk_buf, buf, sizeof(spk_buf));
-        (void)aec_ref;
+        mixer_pull(spk_buf, aec_ref);
 #if AUDIO_DIAG_MIC_LEVEL
         {
             static uint32_t s_spk_n = 0;
