@@ -133,8 +133,8 @@ static const char *TAG = "audio";
 /* ---- Module state ---- */
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
 
-static i2s_chan_handle_t       s_spk_tx_chan = NULL;
-static i2s_chan_handle_t       s_mic_rx_chan = NULL;
+static i2s_chan_handle_t       s_spk_tx_chan = NULL;  /* ES8311 DAC on I2S0 */
+static i2s_chan_handle_t       s_mic_rx_chan = NULL;  /* ES7243 ADC on I2S1 */
 
 static const audio_codec_data_if_t *s_spk_data_if = NULL;
 static const audio_codec_data_if_t *s_mic_data_if = NULL;
@@ -204,15 +204,21 @@ void audio_pipeline_start(void)
         ESP_LOGE(TAG, "spk codec open failed: %d", rc);
         return;
     }
-    rc = esp_codec_dev_open(s_mic_dev, &fs);
+    /* For the mic read we want STEREO frames so the I2S RX delivers
+     * just the right slot (where ES7243 puts AINRP/AINRN). */
+    esp_codec_dev_sample_info_t mic_fs = fs;
+    mic_fs.channel      = 2;
+    mic_fs.channel_mask = 0x02;
+    rc = esp_codec_dev_open(s_mic_dev, &mic_fs);
     if (rc != ESP_CODEC_DEV_OK) {
         ESP_LOGE(TAG, "mic codec open failed: %d", rc);
         return;
     }
 
-    /* ~75% out, +24 dB mic gain — reasonable bring-up values, tune on bench. */
-    esp_codec_dev_set_out_vol(s_spk_dev, 75);
-    esp_codec_dev_set_in_gain(s_mic_dev, 24.0f);
+    /* Volume + gain tuned for v0 bench loopback. Mic at 33 dB stays
+     * a couple of dB clear of ES7243's 37.5 dB saturation ceiling. */
+    esp_codec_dev_set_out_vol(s_spk_dev, 100);
+    esp_codec_dev_set_in_gain(s_mic_dev, 33.0f);
 
     /* Speaker amp must be high to actually hear anything. */
     gpio_set_level(PA_ENABLE_GPIO, 1);
@@ -323,8 +329,11 @@ static esp_err_t init_i2s_channels(void)
 
     i2s_std_config_t mic_std = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SR_HZ),
+        /* Stereo slot, but mask to RIGHT only: the mic is on ES7243's
+         * AINRP/AINRN (right channel); the LEFT slot carries the AEC
+         * loopback (ES8311 OUTP/OUTN fed back into AINLP/AINLN). */
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
-                                                       I2S_SLOT_MODE_MONO),
+                                                       I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = MIC_I2S_MCLK_GPIO,
             .bclk = MIC_I2S_BCLK_GPIO,
@@ -334,8 +343,9 @@ static esp_err_t init_i2s_channels(void)
             .invert_flags = { 0 },
         },
     };
-    /* ES7243E needs an external MCLK; default multiplier (256x fs) is fine. */
+    /* ES7243 needs an external MCLK; default multiplier (256x fs) is fine. */
     mic_std.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+    mic_std.slot_cfg.slot_mask    = I2S_STD_SLOT_RIGHT;
 
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_mic_rx_chan, &mic_std),
                         TAG, "i2s1 init_std_mode");
@@ -451,12 +461,26 @@ static esp_err_t init_codecs(void)
         }
     }
 
+    /* Don't override s_mic_dev — keep it pointed at the ES7243 dev. */
+
+    /* Mic source is the ES7243 dev built above. The schematic confirms
+     * the J6 MIC connector goes through C64/C65 (populated) to ES7243's
+     * AINRP/AINRN (right channel, pins 15/16). ES8311's MIC pins are
+     * dead because the C21/C22 coupling caps are marked NC. ES7243's
+     * AINLP/AINLN carry ES8311's OUTP/OUTN as the AEC loopback. */
+    ESP_LOGI(TAG, "mic source: ES7243 AINRP/AINRN (right channel)");
+
     return ESP_OK;
 }
 
 /* ====================================================================== */
 /* loopback task                                                          */
 /* ====================================================================== */
+
+/* Diagnostic: when set, log per-frame mic peak and RMS once per second.
+ * Useful for tuning gain on the bench. Cheap (one ESP_LOGI per second)
+ * so it's left on by default for v0. */
+#define AUDIO_DIAG_MIC_LEVEL 1
 
 static void loopback_task(void *arg)
 {
@@ -482,10 +506,29 @@ static void loopback_task(void *arg)
             }
             continue;
         }
-        rc = esp_codec_dev_write(s_spk_dev, buf, LOOPBACK_FRAME_BYTES);
-        if (rc != ESP_CODEC_DEV_OK) {
+#if AUDIO_DIAG_MIC_LEVEL
+        {
+            static uint32_t s_frame_n = 0;
+            int16_t peak = 0;
+            int64_t sum_sq = 0;
+            for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
+                int16_t s = buf[i];
+                int16_t a = s < 0 ? -s : s;
+                if (a > peak) peak = a;
+                sum_sq += (int32_t)s * (int32_t)s;
+            }
+            if ((++s_frame_n % 100) == 0) {  /* every 1 s @ 10 ms frames */
+                uint32_t rms = (uint32_t)__builtin_sqrt(
+                        (double)(sum_sq / AUDIO_FRAME_SAMPLES));
+                ESP_LOGI(TAG, "mic level: peak=%d rms=%lu", peak,
+                         (unsigned long)rms);
+            }
+        }
+#endif /* AUDIO_DIAG_MIC_LEVEL */
+        int rc_w = esp_codec_dev_write(s_spk_dev, buf, LOOPBACK_FRAME_BYTES);
+        if (rc_w != ESP_CODEC_DEV_OK) {
             if ((++underruns % 100) == 1) {
-                ESP_LOGW(TAG, "loopback: write err %d (count %lu)", rc,
+                ESP_LOGW(TAG, "loopback: write err %d (count %lu)", rc_w,
                          (unsigned long)underruns);
             }
         }
