@@ -38,6 +38,18 @@
 
 static const char *TAG = "main";
 
+static void on_mesh_event(mesh_event_t evt, uint8_t rider_id)
+{
+    switch (evt) {
+    case MESH_EVT_JOINED:           ESP_LOGI(TAG, "mesh: joined at slot %u", rider_id); break;
+    case MESH_EVT_LEFT:              ESP_LOGI(TAG, "mesh: left"); break;
+    case MESH_EVT_PEER_JOINED:       ESP_LOGI(TAG, "mesh: peer joined at slot %u", rider_id); break;
+    case MESH_EVT_PEER_LEFT:         ESP_LOGI(TAG, "mesh: peer left at slot %u", rider_id); break;
+    case MESH_EVT_COORDINATOR_LOST:  ESP_LOGW(TAG, "mesh: coordinator lost"); break;
+    case MESH_EVT_COORDINATOR_ME:    ESP_LOGI(TAG, "mesh: we are now coordinator"); break;
+    }
+}
+
 static void platform_init(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -78,6 +90,7 @@ void app_main(void)
     uint8_t psk[16];
     ESP_ERROR_CHECK(nvs_cfg_get_psk(psk));
     ESP_ERROR_CHECK(mesh_mac_init(psk));
+    mesh_mac_set_event_cb(on_mesh_event);
 
     ESP_ERROR_CHECK(bt_classic_init());
     session_fsm_init();
@@ -86,7 +99,13 @@ void app_main(void)
     /* Start the pipelines. Each module spawns its own FreeRTOS tasks
      * pinned per the plan (audio on Core 1, radio + control on Core 0). */
     audio_pipeline_start();
-    mesh_mac_start();
+    ESP_ERROR_CHECK(mesh_mac_start());
+
+    uint8_t slot;
+    esp_err_t join_err = mesh_mac_join(&slot);
+    if (join_err != ESP_OK) {
+        ESP_LOGW(TAG, "mesh join failed: %s", esp_err_to_name(join_err));
+    }
 
     ESP_LOGI(TAG, "bike_comm ready");
 

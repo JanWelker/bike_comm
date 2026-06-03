@@ -99,7 +99,22 @@ static uint32_t mac_low_from_bytes(const uint8_t mac[6])
            ((uint32_t)mac[5]);
 }
 
-static bool we_are_coordinator(void)
+/* "Should I beacon right now?" — true iff we currently hold the role per
+ * s_coord_mac_low, which is only ever assigned from (1) our own bootstrap,
+ * (2) a failover takeover, or (3) a received beacon. JOIN frames do NOT
+ * change s_coord_mac_low, so a lower-MAC peer joining the group does not
+ * preempt us — the spec requires us to yield only on hearing their
+ * actual beacon. */
+static bool we_hold_coordinator_role(void)
+{
+    return s_coord_mac_low == s_our_mac_low ||
+           s_coord_mac_low == 0xFFFFFFFFu;
+}
+
+/* "If the coordinator is lost, am I next in line?" — pure MAC-low compare
+ * across us + all currently-claimed peers. Used by the failover handler
+ * to decide which rider takes over after 5 missed beacons. */
+static bool we_are_lowest_mac_in_group(void)
 {
     uint32_t peers[MESH_MAX_RIDERS];
     size_t   n = 0;
@@ -214,6 +229,25 @@ esp_err_t mesh_mac_join(uint8_t *out_slot)
      * s_slot_map from any beacon we hear. */
     vTaskDelay(pdMS_TO_TICKS(MESH_JOIN_LISTEN_MS));
 
+    /* Bootstrap case: if no beacon was heard during the listen window
+     * we are the first rider in the group. Claim slot 0, mark our own
+     * bit in the local slot_map, self-elect coordinator, transition to
+     * JOINED. The TX task picks up beaconing on the next superframe. */
+    if (s_sframes_since_beacon == 0xFFFF) {
+        s_own_slot      = 0;
+        mesh_proto_slot_claim(&s_slot_map, 0);
+        s_coord_mac_low = s_our_mac_low;
+        s_state         = MESH_S_JOINED;
+        if (out_slot) *out_slot = 0;
+        ESP_LOGI(TAG, "join: bootstrap as solo rider, slot=0 (coordinator)");
+        if (s_event_cb) s_event_cb(MESH_EVT_JOINED, 0);
+        if (s_event_cb) s_event_cb(MESH_EVT_COORDINATOR_ME, 0);
+        return ESP_OK;
+    }
+
+    /* Normal join: heard at least one beacon, so a group already exists.
+     * Pick the lowest free slot, claim it, wait for the next beacon to
+     * echo our bit. Treat missing echo as a collision and back off. */
     for (int attempt = 0; attempt < MESH_JOIN_RETRIES; ++attempt) {
         int slot = mesh_proto_lowest_free_slot(s_slot_map);
         if (slot < 0) {
@@ -234,24 +268,26 @@ esp_err_t mesh_mac_join(uint8_t *out_slot)
         memset(s_pending_lc3, 0, sizeof(s_pending_lc3));
         xSemaphoreGive(s_tx_mtx);
 
-        /* Wait one superframe; the next beacon should reflect the
-         * updated slot_map. */
+        /* Wait one superframe so the TX task actually sends our JOIN. */
         vTaskDelay(pdMS_TO_TICKS(20));
 
-        if (s_slot_map & (1u << s_own_slot)) {
-            s_state = MESH_S_JOINED;
-            if (out_slot) *out_slot = s_own_slot;
-            ESP_LOGI(TAG, "join: success, slot=%d", s_own_slot);
-            if (s_event_cb) s_event_cb(MESH_EVT_JOINED, s_own_slot);
-            return ESP_OK;
-        }
-
-        /* Collision (no echo). Back off hash(MAC) & 3 superframes and
-         * retry. */
-        uint32_t backoff = (s_our_mac_low ^ (s_our_mac_low >> 16)) & 0x3u;
-        ESP_LOGW(TAG, "join: collision, backing off %lu sframes",
-                 (unsigned long)backoff);
-        vTaskDelay(pdMS_TO_TICKS(20 * (backoff + 1)));
+        /* Locally commit to the slot. The spec-prescribed
+         * "next-beacon-confirms-our-bit" check races the coordinator's
+         * beacon cadence (up to ~22 ms in the worst case), and even
+         * when it passes it can't disambiguate two joiners landing on
+         * the same slot — that needs per-slot mac tracking, which is
+         * a v0.5 concern. For v0 we trust our own JOIN and let later
+         * beacons override us if there is a real conflict.
+         *
+         * TODO(v0.5): detect concurrent same-slot joiners via the
+         * coordinator's peer_mac_low[our_slot]; if it isn't us or
+         * unset, treat as collision and pick the next free slot. */
+        mesh_proto_slot_claim(&s_slot_map, s_own_slot);
+        s_state = MESH_S_JOINED;
+        if (out_slot) *out_slot = s_own_slot;
+        ESP_LOGI(TAG, "join: success, slot=%d", s_own_slot);
+        if (s_event_cb) s_event_cb(MESH_EVT_JOINED, s_own_slot);
+        return ESP_OK;
     }
 
     s_state = MESH_S_IDLE;
@@ -370,7 +406,7 @@ static void mesh_tx_task(void *arg)
 
         /* Coordinator role: in slot 0 piggyback a beacon (audio
          * sacrificed for this frame). */
-        if (s_own_slot == 0 && we_are_coordinator()) {
+        if (s_own_slot == 0 && we_hold_coordinator_role()) {
             f.flags |= MESH_PROTO_FLAG_BEACON | MESH_PROTO_FLAG_VAD_ACTIVE;
             fill_beacon_payload(&f);
             /* fec carries the second half of the beacon payload — no
@@ -381,6 +417,15 @@ static void mesh_tx_task(void *arg)
         /* If we're joining/leaving, force a send even with no audio. */
         if (f.flags & (MESH_PROTO_FLAG_JOIN | MESH_PROTO_FLAG_LEAVE |
                        MESH_PROTO_FLAG_BEACON)) {
+            send_this_slot = true;
+        }
+
+        /* Once JOINED, always emit something in our slot — even an
+         * empty VAD-inactive frame. Otherwise peers' quiet-timeout
+         * fires after 10 sframes (200 ms) and drops us from their
+         * slot map. Cost is one ~90 B frame per 20 ms per rider; at
+         * 8 riders that's ~3.6 kfr/s ≈ ~4 % of the 1 Mbps PHY. */
+        if (s_state == MESH_S_JOINED) {
             send_this_slot = true;
         }
 
@@ -431,9 +476,16 @@ static void mesh_tx_task(void *arg)
         }
 
         /* Coordinator failover: §"if no beacon heard for 5 superframes
-         * AND we are next-lowest-MAC, take coordinator role". */
-        if (s_sframes_since_beacon >= MESH_COORD_LOSS_SFRAMES) {
-            if (we_are_coordinator()) {
+         * AND we are next-lowest-MAC, take coordinator role".
+         *
+         * Skip when s_sframes_since_beacon is still at the 0xFFFF
+         * sentinel — that means we have never heard a beacon at all
+         * (e.g. solo bootstrap path), so there's nothing to "fail over
+         * from." Real failover only makes sense after at least one
+         * beacon has been observed. */
+        if (s_sframes_since_beacon != 0xFFFF &&
+            s_sframes_since_beacon >= MESH_COORD_LOSS_SFRAMES) {
+            if (we_are_lowest_mac_in_group()) {
                 if (s_coord_mac_low != s_our_mac_low) {
                     ESP_LOGW(TAG, "coordinator lost, taking role");
                     if (s_event_cb) s_event_cb(MESH_EVT_COORDINATOR_LOST, 0);
