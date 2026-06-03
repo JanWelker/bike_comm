@@ -37,24 +37,29 @@ idf.py -p /dev/cu.usbserial-XXXX flash monitor
 
 You should see `bike_comm starting (chip: ESP32 single-chip path)` and `bike_comm ready`. None of the modules do anything real yet — this just validates the build + boot.
 
-## Bring-up order
+## Bring-up order (status reflects what's actually working on the bench)
 
-1. **NVS + UI + LED** — confirm GPIOs match LyraT-Mini schematic; pulse the LED.
-2. **Audio I/O** — I2S mic loopback to I2S speaker, no DSP. Hear your own voice with ~40 ms latency.
-3. **ESP-SR AFE** — wire AEC + NS + VAD. Loopback should now sound clean.
-4. **LC3** — vendor `google/liblc3` into `firmware/components/liblc3/`; encode + decode roundtrip; bit-exact against the LC3 conformance vectors.
-5. **ESP-NOW raw** — board A broadcasts 30 B test pattern @ 100 Hz; board B receives and logs. Validate range and packet loss across the room.
-6. **2-slot TDMA** — minimal version of `mesh_mac.c`: hardcoded 2 riders, alternating slots, no beacon.
-7. **Audio over ESP-NOW** — encoder → mesh TX → mesh RX → decoder → speaker. **Milestone.**
-8. **Bidirectional, both boards** — two-way conversation through wired headsets.
+1. **NVS + UI + LED** — done; module init order in `main.c` is the source of truth.
+2. **Audio I/O** — done. ES8311 playback + ES7243 mic ADC via `esp_codec_dev`. Onboard MEMS lands on ES7243 `AINRP/AINRN` (right channel, stereo I2S slot mask = RIGHT). ES8311 mic pins are dead on v1.2 (caps `(NC)`), so we don't use them. See the comment block at the top of `firmware/main/audio_pipeline.c` for the full pin map. Self-loopback verified through the 3.5 mm jack with a wired headphone.
+3. **LC3** — done. `firmware/components/liblc3/upstream/` vendored at v1.1.1; `codec_lc3_init` pre-allocates the shared encoder and all 8 decoder slots upfront (lazy-allocating inside the wifi recv callback drops beacons).
+4. **ESP-NOW + custom TDMA** — done. `mesh_mac.c` does join with bootstrap path for solo coordinator, alternating beacon/audio in slot 0 (lets the coordinator transmit its own mic in addition to beaconing every 40 ms), per-rider quiet-timeout, XOR-FEC piggyback, anti-replay seq tracking, and coord-loss failover (10 sframes = 200 ms tolerant of short RF bursts).
+5. **Audio over ESP-NOW (one direction)** — done. Joiner → coordinator at ~50 fps decoded.
+6. **Audio over ESP-NOW (bidirectional)** — done. Coordinator's slot-0 alternates beacon/audio so it can also TX; ~25 fps reverse direction.
+7. **ESP-SR AFE** — not yet. Wire AEC + NS + VAD onto the audio_io task; the AEC reference signal is already exposed (`mixer_pull` second arg) and the schematic-level loopback path (ES8311 OUT → ES7243 `AINLP/AINLN`) already gives the AFE the speaker echo to subtract.
 
 ## What we are NOT doing in v0
 
-- Phone (HFP/A2DP) — that's v0.5
-- Beacon / coordinator failover — v0.5
-- XOR FEC — v0.5
-- Real helmet — v1 problem
-- Custom PCB — v1
+- Phone (HFP/A2DP) — that's v0.5.
+- 4-node mesh / large slot map — v0.5; the TDMA logic already supports 8 slots, just hasn't been load-tested past 2.
+- Beacon-PLL time sync — v0.5. Local `esp_timer_get_time()` drives the superframe scheduler today. Drift is bounded at ±20 ppm crystal so we don't see slot collisions on the 2-board bench, but multi-node + longer durations will need PLL.
+- Per-slot peer-mac collision detection — v0.5; today we trust ourselves on JOIN.
+- Real helmet — v1.
+- Custom PCB — v1.
+
+## Known gotchas
+
+- `audio_io` task stack must be **7 KB**. 4 KB overflows on LC3 encode + cross-core mesh mutex (manifests as a wild-PC `Guru Meditation IllegalInstruction` on core 0). 8 KB starts crowding internal RAM enough for `mesh_mac_start` to OOM.
+- The ESP-NOW recv callback runs in the wifi task and **cannot block or allocate**. `on_mesh_rx` in `main.c` only memcpys to a small struct and `xQueueSend`s with timeout 0; the audio_io task drains the queue.
 
 ## Definition of done for v0
 

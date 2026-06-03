@@ -28,7 +28,9 @@ static const char *TAG = "mesh";
 #define MESH_CORE                0
 #define MESH_JOIN_LISTEN_MS     60        /* 3 superframes */
 #define MESH_JOIN_RETRIES        3
-#define MESH_COORD_LOSS_SFRAMES  5        /* §coordinator failover */
+#define MESH_COORD_LOSS_SFRAMES  10       /* 200 ms: tolerates short bursts of RF
+                                             beacon loss now that the coordinator
+                                             only beacons every other superframe */
 #define MESH_PEER_QUIET_SFRAMES 10        /* §implicit leave        */
 
 static const uint8_t BROADCAST_MAC[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };

@@ -59,7 +59,7 @@ offset  size  field
   17    49    reserved (zeros, for future fields)
 ```
 
-The coordinator piggybacks the beacon on slot 0 by setting BEACON + VAD flags; slot 0's actual audio is sacrificed during a beacon frame (acceptable — once per 20 ms, only the coordinator).
+The coordinator emits a beacon by setting BEACON + VAD flags on a slot-0 frame; the lc3+fec bytes are overwritten by the beacon payload above. To let the coordinator still transmit its own audio, slot 0 **alternates** between beacon (even superframes) and audio (odd superframes), halving the beacon rate to 25 fps (one beacon every 40 ms). The coordinator-loss timer (10 superframes ≈ 200 ms) tolerates the wider gap.
 
 ## Join
 

@@ -6,15 +6,23 @@ In the spirit of the commercial alternatives, but designed to be reproducible by
 
 ## Status
 
-**Pre-v0.** Architecture is locked; firmware skeleton in place; waiting on first dev boards.
+**v0 mesh-audio working on the bench, two boards.** Mic on board A,
+mic on board B, both heard on the opposite board. Plumbing end-to-end
+from `i2s_channel_read` -> LC3 encode -> ESP-NOW broadcast ->
+ESP-NOW recv callback -> queue -> mixer JB -> LC3 decode ->
+`i2s_channel_write`. Mesh discovery, slot claim, beacon (alternating
+with audio in the coordinator's slot), and quiet-timeout failover all
+implemented and verified across tens of seconds of soak. No HFP/A2DP
+to the phone yet; that's the v0.5 piece.
 
-See [`docs/architecture.md`](docs/architecture.md) for the design. The full planning document is at `~/.claude/plans/this-is-a-new-purring-storm.md` for now and will be folded in.
+See [`docs/architecture.md`](docs/architecture.md) for the design and
+[`docs/mesh_protocol.md`](docs/mesh_protocol.md) for the wire spec.
 
 ## Hardware
 
-- **MCU:** Original Espressif ESP32 (WROVER-E or WROVER-IE), single-chip. BT Classic + ESP-NOW on one radio.
-- **Audio:** ES8388 codec, INMP441 MEMS mic, MAX98357A I2S amp.
-- **Dev board for bring-up:** ESP32-LyraT-Mini (has the whole audio chain integrated).
+- **MCU:** Original Espressif ESP32 (WROVER-E), single-chip. BT Classic + ESP-NOW on one radio.
+- **Dev board for v0:** ESP32-LyraT-Mini v1.2. ES8311 playback + ES7243 mic ADC + onboard MEMS on AINRP/AINRN.
+- **Custom PCB target:** ES8388 codec, INMP441 MEMS mic, MAX98357A I2S amp (planned for v1).
 
 ## Firmware
 
