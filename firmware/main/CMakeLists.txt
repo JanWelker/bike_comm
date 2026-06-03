@@ -19,7 +19,11 @@ idf_component_register(
         esp_coex
         bt
         driver
+        esp_driver_gpio
+        esp_driver_i2c
+        esp_driver_i2s
         esp_event
         esp_timer
         liblc3
+        esp_codec_dev
 )

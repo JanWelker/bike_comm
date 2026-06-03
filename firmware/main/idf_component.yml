@@ -1,0 +1,10 @@
+## Managed components for the `main` IDF component.
+##
+## esp_codec_dev: Espressif's modern, actively-maintained codec HAL. Replaces
+## the deprecated `espressif/es8311` driver and adds support for the ES7243E
+## mic-ADC that the LyraT-Mini v1.2 also carries on a separate I2S bus.
+## See audio_pipeline.c for board wiring details.
+dependencies:
+  idf:
+    version: ">=5.5"
+  espressif/esp_codec_dev: "^1.5.10"
