@@ -70,6 +70,22 @@ esp_err_t codec_lc3_init(void)
     }
 
     ESP_LOGI(TAG, "init ok (24 kbps, 10 ms, 16 kHz, enc state %u B)", sz);
+
+    /* Pre-allocate all decoder slots up front. The original design
+     * was lazy (acquire on first frame from a rider) but that puts a
+     * heap_caps_malloc inside the ESP-NOW receive callback, which
+     * stalls the wifi task long enough to drop beacons and trip the
+     * coordinator-lost timer on the other end. Doing it here trades
+     * ~8 * lc3_decoder_size() = ~8 KB of internal RAM for a recv-path
+     * that's free of allocations and any per-rider first-time cost. */
+    for (uint8_t r = 0; r < LC3_MAX_DECODERS; r++) {
+        esp_err_t err = codec_lc3_decoder_acquire(r);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "pre-acquire decoder[%u] failed: %s", r,
+                     esp_err_to_name(err));
+            return err;
+        }
+    }
     return ESP_OK;
 }
 

@@ -59,10 +59,14 @@ void mixer_push_remote_frame(uint8_t rider_id,
     if (rider_id >= MIXER_RIDERS) return;
     if (lc3 == NULL || len == 0 || len > LC3_FRAME_BYTES) return;
 
+    /* Called from the audio_rx task (NOT the wifi callback any more —
+     * the callback enqueues, this drains). Blocking on the mutex is
+     * fine here. */
     xSemaphoreTake(s_mtx, portMAX_DELAY);
     rider_state_t *r = &s_riders[rider_id];
     if (!r->in_use) {
-        codec_lc3_decoder_acquire(rider_id);
+        /* Decoder was pre-allocated in codec_lc3_init; this is just a
+         * flag flip. No malloc on the recv path. */
         r->in_use = true;
     }
     mixer_jb_push(&r->jb, seq, vad_active, lc3, (uint8_t)len);

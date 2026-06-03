@@ -75,6 +75,13 @@
  */
 
 #include "audio_pipeline.h"
+#include "codec_lc3.h"
+#include "mesh_mac.h"
+#include "mixer.h"
+
+/* Implemented in main.c: drains the wifi-RX-to-mixer queue. Declared
+ * here as extern so the audio_io task can drive it on every tick. */
+extern void mesh_rx_drain_to_mixer(void);
 
 #include <string.h>
 
@@ -225,8 +232,13 @@ void audio_pipeline_start(void)
     ESP_LOGI(TAG, "PA enable high");
 
     s_running = true;
+    /* 4 KB was OK for plain mic->spk loopback; with codec_lc3_encode +
+     * mesh_mac_queue_tx + mixer_pull + drain in the hot path we need
+     * more headroom or the task overflows and corrupts core 0 via
+     * the cross-core mutex. 6 KB is comfortable AND leaves enough
+     * internal RAM for mesh_tx_task + audio_rx work afterwards. */
     BaseType_t ok = xTaskCreatePinnedToCore(loopback_task, "audio_loopback",
-                                            4096, NULL, LOOPBACK_TASK_PRIO,
+                                            6144, NULL, LOOPBACK_TASK_PRIO,
                                             NULL, AUDIO_CORE);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "loopback task create failed");
@@ -493,15 +505,22 @@ static void loopback_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "loopback: %d samples/frame @ %d Hz", AUDIO_FRAME_SAMPLES,
-             AUDIO_SR_HZ);
+    /* Pre-allocate the LC3 encode buffer + the mixer pull buffer so we
+     * don't hit malloc in the hot loop. */
+    uint8_t lc3_buf[LC3_FRAME_BYTES];
+    int16_t spk_buf[AUDIO_FRAME_SAMPLES];
+    int16_t aec_ref[AUDIO_FRAME_SAMPLES];
+
+    ESP_LOGI(TAG, "audio io: %d samples/frame @ %d Hz, mic->mesh + mixer->spk",
+             AUDIO_FRAME_SAMPLES, AUDIO_SR_HZ);
 
     uint32_t underruns = 0;
     while (s_running) {
+        /* --- Capture: mic -> LC3 -> mesh queue. */
         int rc = esp_codec_dev_read(s_mic_dev, buf, LOOPBACK_FRAME_BYTES);
         if (rc != ESP_CODEC_DEV_OK) {
             if ((++underruns % 100) == 1) {
-                ESP_LOGW(TAG, "loopback: read err %d (count %lu)", rc,
+                ESP_LOGW(TAG, "audio io: mic read err %d (count %lu)", rc,
                          (unsigned long)underruns);
             }
             continue;
@@ -525,10 +544,48 @@ static void loopback_task(void *arg)
             }
         }
 #endif /* AUDIO_DIAG_MIC_LEVEL */
-        int rc_w = esp_codec_dev_write(s_spk_dev, buf, LOOPBACK_FRAME_BYTES);
+        /* v0 baseline: self-loopback only (mic -> own spk). The
+         * encode + mesh_tx + drain + mixer_pull integration regresses
+         * mesh discovery in a way that needs deeper investigation
+         * (clock-drift collisions between slot-0 beacons and slot-1
+         * audio TX, no beacon-PLL until v0.5). Keep the wiring ready
+         * but don't fire it for now:
+         *
+         *   codec_lc3_encode(buf, lc3_buf);
+         *   mesh_mac_queue_tx(lc3_buf, true);
+         *   mesh_rx_drain_to_mixer();
+         */
+        (void)lc3_buf;
+
+        /* v0 baseline: write the mic buffer to the speaker directly
+         * (self-loopback). Once mesh-audio is debugged, replace with
+         * `mixer_pull(spk_buf, aec_ref);` which fills spk_buf with
+         * the decoded+mixed remote audio. */
+        memcpy(spk_buf, buf, sizeof(spk_buf));
+        (void)aec_ref;
+#if AUDIO_DIAG_MIC_LEVEL
+        {
+            static uint32_t s_spk_n = 0;
+            int16_t peak = 0;
+            int64_t sum_sq = 0;
+            for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
+                int16_t s = spk_buf[i];
+                int16_t a = s < 0 ? -s : s;
+                if (a > peak) peak = a;
+                sum_sq += (int32_t)s * (int32_t)s;
+            }
+            if ((++s_spk_n % 100) == 0) {
+                uint32_t rms = (uint32_t)__builtin_sqrt(
+                        (double)(sum_sq / AUDIO_FRAME_SAMPLES));
+                ESP_LOGI(TAG, "spk level: peak=%d rms=%lu", peak,
+                         (unsigned long)rms);
+            }
+        }
+#endif
+        int rc_w = esp_codec_dev_write(s_spk_dev, spk_buf, LOOPBACK_FRAME_BYTES);
         if (rc_w != ESP_CODEC_DEV_OK) {
             if ((++underruns % 100) == 1) {
-                ESP_LOGW(TAG, "loopback: write err %d (count %lu)", rc_w,
+                ESP_LOGW(TAG, "audio io: spk write err %d (count %lu)", rc_w,
                          (unsigned long)underruns);
             }
         }
