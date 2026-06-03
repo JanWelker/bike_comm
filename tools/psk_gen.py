@@ -2,10 +2,13 @@
 """
 psk_gen — generate a 128-bit mesh group PSK.
 
-The PSK is the AES-128 key used by ESP-NOW for encryption + authentication
-of mesh frames. Two riders with the same PSK are in the same group; two
-riders with different PSKs can be in RF range but cannot decrypt each
-other's packets (and our app-layer also ignores them).
+The PSK is the 128-bit group secret two riders need to share to be on
+the same mesh. ESP-NOW broadcast is plaintext on the wire (broadcast
+can't use the chip's AES-128-CCM, only unicast peers can — see
+docs/mesh_protocol.md "Security"). v0 still installs this PSK via
+esp_now_set_pmk so the upgrade to either app-layer CCM or N unicast
+peers doesn't change the pairing UX. The app layer already ignores
+frames from peers whose PSK we don't share.
 
 Usage:
     psk_gen.py                  # print hex + base64 + optional QR

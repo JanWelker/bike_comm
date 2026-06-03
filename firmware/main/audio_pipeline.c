@@ -538,29 +538,31 @@ static void loopback_task(void *arg)
             }
             if ((++s_frame_n % 100) == 0) {  /* every 1 s @ 10 ms frames */
                 uint32_t rms = (uint32_t)__builtin_sqrt(
-                        (double)(sum_sq / AUDIO_FRAME_SAMPLES));
+                        (double)sum_sq / AUDIO_FRAME_SAMPLES);
                 ESP_LOGI(TAG, "mic level: peak=%d rms=%lu", peak,
                          (unsigned long)rms);
             }
         }
 #endif /* AUDIO_DIAG_MIC_LEVEL */
-        /* v0 baseline: self-loopback only (mic -> own spk). The
-         * encode + mesh_tx + drain + mixer_pull integration regresses
-         * mesh discovery in a way that needs deeper investigation
-         * (clock-drift collisions between slot-0 beacons and slot-1
-         * audio TX, no beacon-PLL until v0.5). Keep the wiring ready
-         * but don't fire it for now:
-         *
-         *   codec_lc3_encode(buf, lc3_buf);
-         *   mesh_mac_queue_tx(lc3_buf, true);
-         *   mesh_rx_drain_to_mixer();
-         */
-        (void)lc3_buf;
+        /* v0 mesh-audio: send the local mic + drain remote frames into
+         * the mixer. The mixer pull is still gated below because that
+         * specific call surfaces a crash/regression we haven't fully
+         * unpacked yet — see the comment above the playback block. */
+        codec_lc3_encode(buf, lc3_buf);
+        mesh_mac_queue_tx(lc3_buf, /*vad_active=*/true);
+        mesh_rx_drain_to_mixer();
 
-        /* v0 baseline: write the mic buffer to the speaker directly
-         * (self-loopback). Once mesh-audio is debugged, replace with
-         * `mixer_pull(spk_buf, aec_ref);` which fills spk_buf with
-         * the decoded+mixed remote audio. */
+        /* v0 playback: self-loopback (mic to own speaker). Enabling
+         * `mixer_pull(spk_buf, aec_ref)` here regresses the mesh on
+         * the joiner (coordinator-lost within ~100 ms) AND occasionally
+         * crashes the coordinator with a wild-PC Guru Meditation on
+         * core 0 — best guess is that mixer_pull's LC3-decode hot loop
+         * on core 1 starves wifi RX on core 0 just enough to drop
+         * beacons. TX + drain into the mixer is healthy (see the
+         * `rx drain` log climbing at ~50 fps on the coordinator), so
+         * remote frames ARE flowing into the JB — we just don't play
+         * them back yet. Re-enabling this block is the next focused
+         * piece of work. */
         memcpy(spk_buf, buf, sizeof(spk_buf));
         (void)aec_ref;
 #if AUDIO_DIAG_MIC_LEVEL
@@ -576,7 +578,7 @@ static void loopback_task(void *arg)
             }
             if ((++s_spk_n % 100) == 0) {
                 uint32_t rms = (uint32_t)__builtin_sqrt(
-                        (double)(sum_sq / AUDIO_FRAME_SAMPLES));
+                        (double)sum_sq / AUDIO_FRAME_SAMPLES);
                 ESP_LOGI(TAG, "spk level: peak=%d rms=%lu", peak,
                          (unsigned long)rms);
             }
