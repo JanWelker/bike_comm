@@ -404,9 +404,15 @@ static void mesh_tx_task(void *arg)
         s_pending_valid = false;
         xSemaphoreGive(s_tx_mtx);
 
-        /* Coordinator role: in slot 0 piggyback a beacon (audio
-         * sacrificed for this frame). */
-        if (s_own_slot == 0 && we_hold_coordinator_role()) {
+        /* Coordinator role: alternate slot-0 between beacon (even
+         * superframes) and audio (odd superframes). Original spec
+         * had beacon every superframe, which trashes the coordinator's
+         * own audio TX; halving the beacon rate to 25 fps gives peers
+         * 40 ms between beacons (still well below the 100 ms
+         * coordinator-lost threshold) and lets the coordinator emit
+         * actual audio on the off-frames. */
+        if (s_own_slot == 0 && we_hold_coordinator_role() &&
+            (s_superframe_counter & 1u) == 0) {
             f.flags |= MESH_PROTO_FLAG_BEACON | MESH_PROTO_FLAG_VAD_ACTIVE;
             fill_beacon_payload(&f);
             /* fec carries the second half of the beacon payload — no
