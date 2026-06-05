@@ -632,9 +632,11 @@ static void on_esp_now_recv(const esp_now_recv_info_t *info,
      * than (f->seq - 1) — i.e. we missed it in the prior packet — or
      * this is the first packet we've seen from this rider.
      *
-     * Anti-replay is already enforced on f->seq above; the JB at the
-     * receiver side will dedup if lc3_prev happens to duplicate
-     * something it already buffered. */
+     * Both frames are delivered regardless of VAD — the vad flag rides
+     * along on the callback so the mixer can skip decode for silence
+     * frames (clean zero contribution) without falling through to PLC.
+     * Anti-replay is already enforced on f->seq above; the JB will
+     * dedup if lc3_prev happens to duplicate something it buffered. */
     bool vad = (f->flags & MESH_PROTO_FLAG_VAD_ACTIVE) != 0;
     if (s_rx_cb && (f->flags & MESH_PROTO_FLAG_LC3_PREV_VALID)) {
         uint16_t prev_seq = (uint16_t)(f->seq - 1);
@@ -644,8 +646,8 @@ static void on_esp_now_recv(const esp_now_recv_info_t *info,
             s_rx_cb(rid, prev_seq, vad, f->lc3_prev, LC3_FRAME_BYTES);
         }
     }
-    if (s_rx_cb && vad) {
-        s_rx_cb(rid, f->seq, true, f->lc3, LC3_FRAME_BYTES);
+    if (s_rx_cb) {
+        s_rx_cb(rid, f->seq, vad, f->lc3, LC3_FRAME_BYTES);
     }
 }
 

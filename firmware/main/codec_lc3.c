@@ -2,7 +2,7 @@
  * codec_lc3 — thin wrapper over google/liblc3 (vendored at
  * firmware/components/liblc3/upstream).
  *
- * Operating point: 16 kHz mono, 10 ms frames, 24 kbps → 30 B on air.
+ * Operating point: 16 kHz mono, 10 ms frames, 32 kbps → 40 B on air.
  * One shared encoder (TX); one decoder per active remote rider (RX),
  * allocated on demand into a fixed-size pool.
  *
@@ -69,7 +69,7 @@ esp_err_t codec_lc3_init(void)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "init ok (24 kbps, 10 ms, 16 kHz, enc state %u B)", sz);
+    ESP_LOGI(TAG, "init ok (32 kbps, 10 ms, 16 kHz, enc state %u B)", sz);
 
     /* Pre-allocate all decoder slots up front. The original design
      * was lazy (acquire on first frame from a rider) but that puts a
