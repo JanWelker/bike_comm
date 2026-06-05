@@ -200,10 +200,18 @@ dir.
 - [ ] **Stop transmitting during silence (actual airtime save).**
   Phase-1 VAD gating (above) sets the bit correctly but we still TX
   a packet every superframe — the slot-claim invariant (peer
-  quiet-timeout = 10 sframes / 200 ms) requires it. Real airtime
-  savings need a heartbeat scheme: skip TX while VAD-inactive,
-  send a single keepalive every K superframes (K < 10). Helps BT
-  Classic coex more than CPU. ~0.5 day.
+  quiet-timeout = `MESH_PEER_QUIET_SFRAMES`) requires it. Real
+  airtime savings need a heartbeat scheme: skip TX while VAD-
+  inactive, send a single keepalive every K superframes. Helps BT
+  Classic coex more than CPU. Tried once and reverted; failure mode
+  to be aware of: with the simple "skip K-1, send 1" loop, the coord
+  side (B1) eventually stopped receiving from the joiner (B2) and
+  declared it dropped, even after bumping `MESH_PEER_QUIET_SFRAMES`
+  for loss margin. The asymmetric break (B1 RX dead, B2 TX healthy,
+  B2 still receiving B1's beacons) wasn't fully explained by the
+  counter math — points at a deeper state-machine interaction once
+  the coord's local view of the slot map shrinks. Worth re-attempting
+  with per-skip diagnostic logs and a smaller initial K (=2 or 3).
 - [ ] **Add Codec2 as a build-time alternate codec behind Kconfig.**
   Source: `M17-Project/codec2` + `onemikedelta/M17-ESP32` (LX6 proof
   via `sh123/esp32_loradv`). 8 B/20 ms frames are 5x smaller than
