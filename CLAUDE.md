@@ -101,11 +101,13 @@ mesh_proto layout-size assertion has caught silent rot before.
   is ~25 KB and lands in PSRAM via the default 16 KB threshold;
   measured cost on LX6 is ~1.5 ms per 10 ms frame (see
   `docs/codec_perf.md`).
-- **The app partition is ~99% full.** Each OTA slot is 0x1C0000
-  (1.75 MB) and the current binary fills nearly all of it — adding
-  any managed component over ~30 KB will overflow. There's a 380 KB
-  unused `storage` spiffs partition at the end of flash that can be
-  shrunk to give the OTA slots more room.
+- **The app partition is ~97% full.** Each OTA slot is 0x1D0000
+  (1.875 MB, bumped this session from 1.75 MB to absorb WebRTC_NS);
+  the current binary fills it to ~3% free. Adding any further
+  managed component over a few tens of KB will overflow. The
+  `storage` spiffs partition at the end of flash is down to 252 KB
+  (was 380 KB before the WebRTC_NS bump) — still room to shrink it
+  further if a future big component lands.
 - **Wi-Fi must stay in `WIFI_MODE_STA` once BT Classic is on.**
   Espressif's coexist.html marks ESP-NOW RX as `S` (stable in STA
   mode only) under all BR/EDR coexistence states; APSTA/AP modes
