@@ -9,8 +9,8 @@ code without re-relearning the same lessons every session.
 An open-source motorcycle helmet intercom on the original ESP32 (LX6,
 WROVER-E). Single radio, single chip, ESP-IDF v5.5.4. Two-board mesh
 audio over ESP-NOW already works on the bench; phone link (HFP-HF +
-A2DP-sink) and ESP-SR AFE are not yet wired. See `README.md` for status
-and `docs/architecture.md` for the layered view.
+A2DP-sink) is not yet wired. See `README.md` for status and
+`docs/architecture.md` for the layered view.
 
 ## Build and flash
 
@@ -30,6 +30,12 @@ Xtensa-specific GCC flags clang doesn't recognize, plus newlib headers
 it can't find. The `.clangd` config at the repo root silences the bulk.
 The source of truth for warnings is `idf.py build` — ignore anything
 that doesn't come from there.
+
+Host tests live under `firmware/test/<module>/` — pure-C builds against
+the platform-independent code (`mesh_proto`, `mixer_jb`, vendored
+liblc3) with plain `cc`, run with `make && ./test_*` in each subdir.
+Run them whenever you touch the wire format or JB logic; the
+mesh_proto layout-size assertion has caught silent rot before.
 
 ## Repo map (where to look)
 
