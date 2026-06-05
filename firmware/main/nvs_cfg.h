@@ -3,7 +3,10 @@
  *
  * Stores:
  *   - paired_phone_addr   (esp_bd_addr_t)
- *   - mesh_group_psk      (16 bytes, AES-128 key for ESP-NOW + auth)
+ *   - mesh_group_psk      (16 bytes; installed via esp_now_set_pmk so the
+ *                          post-v0 encrypted-mesh path slots in without a
+ *                          re-architecture. v0 broadcast traffic is
+ *                          plaintext — see docs/mesh_protocol.md.)
  *   - rider_nickname      (UTF-8, max 16 bytes)
  *   - gain_speaker, gain_mic, gain_mesh  (int8_t, dB offsets)
  *

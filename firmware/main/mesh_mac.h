@@ -14,7 +14,12 @@
  *   - each rider TXs in their own claimed slot; PHY otherwise sleeps
  *
  * Security:
- *   - ESP-NOW native AES-128-CCM with the 16 B group PSK
+ *   - v0 traffic is plaintext on the wire. ESP-NOW's built-in AES-128-CCM
+ *     only applies to unicast peers with encrypt=true; our flat broadcast
+ *     topology can't use it. The 16 B group PSK is still installed via
+ *     esp_now_set_pmk so the encrypted path (app-layer CCM, or N unicast
+ *     peers) drops in without re-architecting. See docs/mesh_protocol.md
+ *     "Security" for the post-v0 plan.
  *   - app-layer monotonic seq for anti-replay
  */
 
