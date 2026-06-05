@@ -62,16 +62,15 @@
  *   audio_pipeline_start() - enables I2S, opens codecs, drives PA high,
  *                            spawns the loopback task on Core 1, prio 22.
  *
- *   loopback task: read 10 ms (160 samples) from the mic codec, write the
- *   same buffer to the speaker codec. The codec_dev read/write APIs go
- *   through the I2S DMA underneath, so the task blocks naturally on DMA.
+ *   loopback task: every 10 ms, read 160 mic samples, LC3-encode them,
+ *   hand them to mesh_mac_queue_tx, drain any incoming mesh frames into
+ *   the mixer, mixer_pull the speaker frame, write it to the codec.
+ *   esp_codec_dev's read/write APIs go through the I2S DMA underneath,
+ *   so the task blocks naturally on DMA. No intermediate queues; this
+ *   is the whole hot path.
  *
  *   Latency: 4 x 240-sample DMA buffers x 2 ports ~= 60 ms end-to-end,
  *   generous and fine for v0.
- *
- *   The get_mic_frame / push_speaker_frame entry points in the header are
- *   pre-existing API surface for the eventual AFE + mixer wiring; they
- *   remain stubs in v0 (no consumers in this build yet).
  */
 
 #include "audio_pipeline.h"
@@ -90,7 +89,6 @@ extern void mesh_rx_drain_to_mixer(void);
 #include "esp_check.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -154,9 +152,6 @@ static const audio_codec_if_t      *s_es7243e_if  = NULL;
 static esp_codec_dev_handle_t  s_spk_dev = NULL;
 static esp_codec_dev_handle_t  s_mic_dev = NULL;
 
-static QueueHandle_t           s_mic_frame_q = NULL;  /* AFE pipe (unused in v0) */
-static QueueHandle_t           s_spk_frame_q = NULL;  /* AFE pipe (unused in v0) */
-
 static volatile bool           s_running     = false;
 
 /* ---- forward decls ---- */
@@ -171,12 +166,6 @@ static void      loopback_task(void *arg);
 esp_err_t audio_pipeline_init(void)
 {
     ESP_LOGI(TAG, "init (LyraT-Mini v1.2: ES8311 playback + ES7243E mic)");
-
-    s_mic_frame_q = xQueueCreate(4, sizeof(audio_frame_t));
-    s_spk_frame_q = xQueueCreate(4, sizeof(audio_frame_t));
-    if (!s_mic_frame_q || !s_spk_frame_q) {
-        return ESP_ERR_NO_MEM;
-    }
 
     ESP_RETURN_ON_ERROR(init_pa_gpio(),       TAG, "pa gpio init");
     ESP_RETURN_ON_ERROR(init_i2c_bus(),       TAG, "i2c bus init");
@@ -247,29 +236,6 @@ void audio_pipeline_start(void)
     } else {
         ESP_LOGI(TAG, "loopback task running on core %d", AUDIO_CORE);
     }
-}
-
-/* The AFE-side API stays in place so callers compile; v0 has no consumers. */
-esp_err_t audio_pipeline_get_mic_frame(audio_frame_t *out, TickType_t timeout)
-{
-    if (!out) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (xQueueReceive(s_mic_frame_q, out, timeout) == pdTRUE) {
-        return ESP_OK;
-    }
-    return ESP_ERR_TIMEOUT;
-}
-
-esp_err_t audio_pipeline_push_speaker_frame(const audio_frame_t *in)
-{
-    if (!in) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (xQueueSend(s_spk_frame_q, in, 0) == pdTRUE) {
-        return ESP_OK;
-    }
-    return ESP_ERR_NO_MEM;
 }
 
 /* ====================================================================== */

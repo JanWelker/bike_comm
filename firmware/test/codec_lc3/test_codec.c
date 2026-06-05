@@ -3,7 +3,7 @@
  *
  * Builds against the vendored liblc3 sources directly (no ESP-IDF) and
  * runs on macOS / Linux. Generates a 1 kHz sine, encodes it at the
- * firmware's operating point (16 kHz / 10 ms / 24 kbps → 30 B / frame),
+ * firmware's operating point (16 kHz / 10 ms / 32 kbps → 40 B / frame),
  * decodes it back, and checks that the output RMS sits within 6 dB of
  * the input RMS. LC3 is lossy but should preserve energy comfortably
  * within that window for a clean tone.
@@ -20,7 +20,7 @@
 #define SAMPLE_RATE_HZ  16000
 #define FRAME_DUR_US    10000
 #define FRAME_SAMPLES   160       /* 10 ms @ 16 kHz */
-#define FRAME_BYTES     30        /* 24 kbps */
+#define FRAME_BYTES     40        /* 32 kbps */
 #define NUM_FRAMES      10        /* 100 ms total */
 #define TOTAL_SAMPLES   (FRAME_SAMPLES * NUM_FRAMES)
 

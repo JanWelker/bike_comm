@@ -25,6 +25,12 @@ idf.py -p /dev/cu.usbserial-XXXX flash monitor
 Two boards are flashed sequentially from one machine. The TTY device
 ID differs per cable / per board — list with `ls /dev/cu.usbserial-*`.
 
+The IDE shows many false-positive diagnostics from clangd — mostly
+Xtensa-specific GCC flags clang doesn't recognize, plus newlib headers
+it can't find. The `.clangd` config at the repo root silences the bulk.
+The source of truth for warnings is `idf.py build` — ignore anything
+that doesn't come from there.
+
 ## Repo map (where to look)
 
 | Path | What's there |
@@ -59,25 +65,37 @@ ID differs per cable / per board — list with `ls /dev/cu.usbserial-*`.
 - **`audio_io` task stack must be 7 KB.** 4 KB overflows on
   LC3 encode + cross-core mesh mutex (symptom: `Guru Meditation
   IllegalInstruction` with a wild PC on core 0, not core 1). 8 KB
-  starves `mesh_mac_start` of internal RAM. Sweet spot is 7168.
+  starves `mesh_mac_start` of internal RAM. 7168 sits right on the
+  cliff — any new BSS or large managed component that grabs DRAM
+  tips us over.
 - **The ESP-NOW recv callback cannot block or allocate.** It runs in
   the wifi task. `heap_caps_malloc` inside the callback (even
   transitively, via lazy codec decoder acquisition) stalls Wi-Fi and
   drops beacons -> coordinator-lost storms on peers. Pre-allocate
   everything at init; the callback only `memcpy`s into a small struct
   and `xQueueSend`s with timeout 0.
-- **Coordinator can't TX both beacon and audio in the same slot.**
-  Slot 0 alternates: beacon on even superframes, audio on odd. This
-  halves the beacon rate to 25 fps (one per 40 ms). The coord-loss
-  timer is set to 10 superframes (200 ms) to tolerate the wider gap.
-  Don't tighten it without also revisiting the beacon cadence.
-- **Mesh audio is currently asymmetric by design.** A joiner -> coord
-  link runs at ~50 fps; coord -> joiner runs at ~25 fps because of the
-  alternating beacon. Proper fix is a dedicated 9th slot for the beacon
-  (v0.5).
+- **Coordinator slot 0 alternates beacon and audio.** Beacon (30 B)
+  sits in the `lc3_prev` half of slot 0 on even superframes; `lc3`
+  still carries one audio frame on those turns. Net rx-drain rates:
+  ~100 fps joiner -> coord, ~75 fps coord -> joiner. Closing the
+  residual gap needs a dedicated 9th beacon slot (v0.5). Coord-loss
+  timer is 10 superframes (200 ms) to tolerate the 40 ms inter-beacon
+  gap — don't tighten without revisiting beacon cadence.
 - **LC3 codec state must live in internal RAM.** `heap_caps_malloc`
   with `MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT`. PSRAM access from the
   hot encode/decode loop craters throughput on the original ESP32.
+- **ESP-SR AFE doesn't work on the LX6 — don't re-add it.** esp-sr
+  2.4.6's precompiled `ns_process` for ESP32 calls
+  `heap_caps_check_integrity_all` and crashes walking our heap; older
+  2.0.5 doesn't have the check but exhausts internal DRAM and OOMs
+  the audio task. Path forward is either ESP32-S3 (where esp-sr is
+  the supported target and has PIE) or vendoring a clean WebRTC NS
+  source tree.
+- **The app partition is ~99% full.** Each OTA slot is 0x1C0000
+  (1.75 MB) and the current binary fills nearly all of it — adding
+  any managed component over ~30 KB will overflow. There's a 380 KB
+  unused `storage` spiffs partition at the end of flash that can be
+  shrunk to give the OTA slots more room.
 
 ## Code conventions
 
@@ -118,8 +136,8 @@ ID differs per cable / per board — list with `ls /dev/cu.usbserial-*`.
 - The mesh path is touchy. Always validate with a two-board soak
   (`idf.py monitor` on both, grep for `coordinator lost`, `peer left`,
   any panic). Sixty seconds of clean log is the bar for "didn't break
-  it." Counts per rider should be ~47 fps (joiner -> coord) and ~24 fps
-  (coord -> joiner).
+  it." Per-rider rx-drain rates should be ~100 fps (joiner -> coord)
+  and ~75 fps (coord -> joiner).
 - A symmetric counts mismatch is the design; an asymmetric *drop* to
   zero is a regression.
 - When tweaking timing constants (slot length, beacon cadence,

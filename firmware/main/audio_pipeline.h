@@ -1,41 +1,31 @@
 /*
- * audio_pipeline — I2S DMA + ESP-SR AFE (AEC/NS/VAD)
+ * audio_pipeline — owns the LyraT-Mini v1.2 I2S + codec wiring and the
+ * single audio_io task that drives the mic -> mesh and mesh -> speaker
+ * path end-to-end.
  *
- * Owns:
- *   - I2S0 input from INMP441 MEMS mic (16 kHz mono)
- *   - I2S1 output to ES8388 codec -> MAX98357A amp (16 kHz mono/stereo)
- *   - ESP-SR AFE pipeline: AEC reference = mixer output (loopback)
+ * Wiring (full pin map in the comment block at the top of the .c):
+ *   - ES8311 on I2S0 -> playback / headphone jack
+ *   - ES7243 on I2S1 -> mic capture (onboard MEMS on right channel)
  *
- * Frame model: 10 ms = 160 samples @ 16 kHz, int16_t.
+ * Frame model: 10 ms = 160 samples @ 16 kHz, int16 mono.
  *
  * Threading:
- *   - i2s_mic_rx task drains DMA into ring buffer (Core 1, prio 22)
- *   - afe_task runs AEC + NS + VAD per frame  (Core 1, prio 21)
- *   - mic frames are delivered to the encoder via afe_get_frame()
- *   - speaker frames come back via spk_push_frame() from the mixer
+ *   - audio_pipeline_init()  allocates I2C + I2S channels, opens codecs.
+ *     Channels left disabled until start().
+ *   - audio_pipeline_start() enables I2S, drives PA-enable high, spawns
+ *     loopback_task (Core 1, prio 22). The task is the whole hot path:
+ *     mic read -> LC3 encode -> mesh_mac_queue_tx ->
+ *     mesh_rx_drain_to_mixer -> mixer_pull -> speaker write. No
+ *     intermediate queues, no separate AFE task — see CLAUDE.md for
+ *     why ESP-SR AFE doesn't fit on the LX6.
  */
 
 #pragma once
 
-#include <stdint.h>
-#include <stdbool.h>
 #include "esp_err.h"
-#include "freertos/FreeRTOS.h"
 
 #define AUDIO_SR_HZ          16000
 #define AUDIO_FRAME_SAMPLES  160   /* 10 ms @ 16 kHz */
 
-typedef struct {
-    int16_t  samples[AUDIO_FRAME_SAMPLES];
-    bool     vad_active;
-    uint32_t timestamp_us;
-} audio_frame_t;
-
 esp_err_t audio_pipeline_init(void);
 void      audio_pipeline_start(void);
-
-/* Blocks until a post-AFE mic frame is available. */
-esp_err_t audio_pipeline_get_mic_frame(audio_frame_t *out, TickType_t timeout);
-
-/* Push a frame to the speaker output (also used as the AEC reference). */
-esp_err_t audio_pipeline_push_speaker_frame(const audio_frame_t *in);
