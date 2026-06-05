@@ -42,18 +42,22 @@ static const char *TAG = "main";
  * task via a FreeRTOS queue. Anything the recv callback does itself
  * stalls the wifi task; even brief work is enough to drop beacons
  * and trip the coordinator-lost timer on a peer. Drain happens in
- * audio_io's normal 10 ms tick via mesh_rx_drain_to_mixer(). */
+ * audio_io's normal 10 ms tick via mesh_rx_drain_to_mixer().
+ *
+ * mesh_mac calls on_mesh_rx once per LC3 frame, so a dual-frame mesh
+ * packet causes two enqueues. The queue is depth 16 to absorb that
+ * 2x without triggering back-pressure drops under nominal load. */
 typedef struct {
     uint8_t  rider_id;
     bool     vad_active;
+    uint16_t seq;                  /* wire seq, fed straight into the JB */
     uint8_t  len;
     uint8_t  lc3[LC3_FRAME_BYTES];
 } rx_msg_t;
 
 static QueueHandle_t s_rx_queue = NULL;
-static uint16_t      s_rx_seq[8] = {0};
 
-static void on_mesh_rx(uint8_t rider_id, bool vad_active,
+static void on_mesh_rx(uint8_t rider_id, uint16_t seq, bool vad_active,
                        const uint8_t *lc3_frame, size_t len)
 {
     if (rider_id >= 8) return;
@@ -61,11 +65,10 @@ static void on_mesh_rx(uint8_t rider_id, bool vad_active,
     if (!s_rx_queue) return;
 
     rx_msg_t msg = { .rider_id = rider_id, .vad_active = vad_active,
-                     .len = (uint8_t)len };
+                     .seq = seq, .len = (uint8_t)len };
     memcpy(msg.lc3, lc3_frame, len);
     /* Non-blocking: if the queue is full, drop the frame. JB + PLC
-     * absorb it. The queue is depth 8 so this only happens under
-     * unusual back-pressure. */
+     * absorb it. */
     (void)xQueueSend(s_rx_queue, &msg, 0);
 }
 
@@ -77,7 +80,7 @@ void mesh_rx_drain_to_mixer(void)
     static uint32_t  s_drain_count[8] = {0};
     static TickType_t s_last_log_tick = 0;
     while (s_rx_queue && xQueueReceive(s_rx_queue, &msg, 0) == pdTRUE) {
-        mixer_push_remote_frame(msg.rider_id, s_rx_seq[msg.rider_id]++,
+        mixer_push_remote_frame(msg.rider_id, msg.seq,
                                 msg.vad_active, msg.lc3, msg.len);
         if (msg.rider_id < 8) s_drain_count[msg.rider_id]++;
     }
@@ -147,9 +150,10 @@ void app_main(void)
     mesh_mac_set_event_cb(on_mesh_event);
     /* Allocate the recv-queue before registering the wifi callback so
      * the very first frame after registration has somewhere to land.
-     * audio_io drains this queue every tick. Depth 8 covers a brief
-     * back-pressure burst. */
-    s_rx_queue = xQueueCreate(8, sizeof(rx_msg_t));
+     * audio_io drains this queue every tick. Depth 16: each mesh packet
+     * may carry 2 LC3 frames (= 2 enqueues), so 16 covers ~4 packets'
+     * worth of back-pressure. */
+    s_rx_queue = xQueueCreate(16, sizeof(rx_msg_t));
     ESP_ERROR_CHECK(s_rx_queue ? ESP_OK : ESP_ERR_NO_MEM);
     mesh_mac_set_rx_cb(on_mesh_rx);
 

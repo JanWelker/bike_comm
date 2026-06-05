@@ -3,14 +3,19 @@
  *
  * Wire format (see docs/mesh_protocol.md for the canonical spec):
  *
- *   | 1 B rider_id (0..7) | 1 B flags (VAD|JOIN|LEAVE|BEACON|FEC) |
- *   | 2 B seq             | 2 B superframe_counter               |
- *   | 30 B LC3 frame      | 30 B XOR parity (F_{n-1} ^ F_n)      |
- *   | 2 B CRC                                                    |
+ *   | 1 B rider_id (0..7) | 1 B flags (VAD|JOIN|LEAVE|BEACON|PREV) |
+ *   | 2 B seq (of lc3)    | 2 B superframe_counter                |
+ *   | 30 B lc3 (current)  | 30 B lc3_prev (current-1, gated PREV) |
+ *   | 2 B CRC                                                     |
+ *
+ * Each packet carries up to two LC3 frames so the 100 Hz mic encode
+ * rate doesn't get halved by the 50 Hz slot cadence. lc3_prev's wire
+ * seq is implicitly seq-1.
  *
  * Timing:
  *   - superframe = 20 ms = 8 x 2.5 ms slots
- *   - lowest-MAC rider in the group beacons in slot 0 (piggybacked)
+ *   - lowest-MAC rider in the group beacons in slot 0 (piggybacked,
+ *     beacon overlays both LC3 slots — no audio that frame)
  *   - each rider TXs in their own claimed slot; PHY otherwise sleeps
  *
  * Security:
@@ -36,11 +41,11 @@
 #define MESH_FRAME_PAYLOAD_BYTES 68    /* on-air bytes per slot */
 
 /* Flags bitfield in the on-air header. */
-#define MESH_FLAG_VAD_ACTIVE   (1u << 0)
-#define MESH_FLAG_JOIN         (1u << 1)
-#define MESH_FLAG_LEAVE        (1u << 2)
-#define MESH_FLAG_BEACON       (1u << 3)
-#define MESH_FLAG_FEC          (1u << 4)
+#define MESH_FLAG_VAD_ACTIVE       (1u << 0)
+#define MESH_FLAG_JOIN             (1u << 1)
+#define MESH_FLAG_LEAVE            (1u << 2)
+#define MESH_FLAG_BEACON           (1u << 3)
+#define MESH_FLAG_LC3_PREV_VALID   (1u << 4)
 
 typedef enum {
     MESH_EVT_JOINED,           /* we successfully claimed a slot */
@@ -51,7 +56,11 @@ typedef enum {
     MESH_EVT_COORDINATOR_ME,   /* we are now the coordinator      */
 } mesh_event_t;
 
-typedef void (*mesh_rx_cb_t)(uint8_t rider_id, bool vad_active,
+/* Delivers one LC3 frame to the application. Called twice per dual
+ * mesh packet — first for lc3_prev (with seq = wire_seq - 1), then for
+ * lc3 (with seq = wire_seq). The seq is the wire seq; receivers feed it
+ * straight into a seq-aware jitter buffer. */
+typedef void (*mesh_rx_cb_t)(uint8_t rider_id, uint16_t seq, bool vad_active,
                              const uint8_t *lc3_frame, size_t len);
 
 typedef void (*mesh_event_cb_t)(mesh_event_t evt, uint8_t rider_id);

@@ -66,43 +66,6 @@ TEST(test_crc_changes_on_bitflip)
 }
 
 /* ------------------------------------------------------------------ */
-/* XOR-FEC                                                             */
-/* ------------------------------------------------------------------ */
-
-TEST(test_fec_roundtrip_random)
-{
-    uint8_t f1[MESH_PROTO_LC3_BYTES];
-    uint8_t f2[MESH_PROTO_LC3_BYTES];
-    uint8_t fec[MESH_PROTO_LC3_BYTES];
-    uint8_t recovered[MESH_PROTO_LC3_BYTES];
-
-    /* Fixed pseudo-random seed for determinism. */
-    srand(0xDEADBEEF);
-    for (size_t i = 0; i < MESH_PROTO_LC3_BYTES; ++i) {
-        f1[i] = (uint8_t)rand();
-        f2[i] = (uint8_t)rand();
-    }
-
-    /* Encoder: fec = current XOR previous = f2 ^ f1. */
-    mesh_proto_fec_encode(f2, f1, fec);
-
-    /* Drop f1, receiver has f2 and fec → recover f1. */
-    mesh_proto_fec_recover(f2, fec, recovered);
-    assert(memcmp(recovered, f1, MESH_PROTO_LC3_BYTES) == 0);
-}
-
-TEST(test_fec_zero_previous)
-{
-    /* When previous was all zeros, fec == current. */
-    uint8_t prev[MESH_PROTO_LC3_BYTES] = {0};
-    uint8_t curr[MESH_PROTO_LC3_BYTES];
-    for (size_t i = 0; i < MESH_PROTO_LC3_BYTES; ++i) curr[i] = (uint8_t)i;
-    uint8_t fec[MESH_PROTO_LC3_BYTES];
-    mesh_proto_fec_encode(curr, prev, fec);
-    assert(memcmp(fec, curr, MESH_PROTO_LC3_BYTES) == 0);
-}
-
-/* ------------------------------------------------------------------ */
 /* Anti-replay                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -220,9 +183,6 @@ int main(void)
     RUN(test_crc_kat_empty);
     RUN(test_crc_kat_A);
     RUN(test_crc_changes_on_bitflip);
-
-    RUN(test_fec_roundtrip_random);
-    RUN(test_fec_zero_previous);
 
     RUN(test_replay_strict_increase);
     RUN(test_replay_stale_rejected);

@@ -27,26 +27,6 @@ uint16_t mesh_proto_crc16(const uint8_t *data, size_t len)
     return crc;
 }
 
-/* ---- XOR FEC ---------------------------------------------------------- */
-
-void mesh_proto_fec_encode(const uint8_t current_lc3[MESH_PROTO_LC3_BYTES],
-                           const uint8_t previous_lc3[MESH_PROTO_LC3_BYTES],
-                           uint8_t       fec_out[MESH_PROTO_LC3_BYTES])
-{
-    for (size_t i = 0; i < MESH_PROTO_LC3_BYTES; ++i) {
-        fec_out[i] = (uint8_t)(current_lc3[i] ^ previous_lc3[i]);
-    }
-}
-
-void mesh_proto_fec_recover(const uint8_t received_lc3_n[MESH_PROTO_LC3_BYTES],
-                            const uint8_t received_fec_n[MESH_PROTO_LC3_BYTES],
-                            uint8_t       recovered_lc3_n_minus_1[MESH_PROTO_LC3_BYTES])
-{
-    for (size_t i = 0; i < MESH_PROTO_LC3_BYTES; ++i) {
-        recovered_lc3_n_minus_1[i] = (uint8_t)(received_lc3_n[i] ^ received_fec_n[i]);
-    }
-}
-
 /* ---- Anti-replay ------------------------------------------------------ */
 
 bool mesh_proto_seq_accept(uint16_t last_seq,

@@ -52,8 +52,6 @@ static uint16_t s_tx_seq = 0;
 /* per-rider book-keeping (index = rider_id) */
 static uint16_t s_last_seq[MESH_MAX_RIDERS];
 static bool     s_seq_seen[MESH_MAX_RIDERS];
-static uint8_t  s_last_lc3[MESH_MAX_RIDERS][LC3_FRAME_BYTES];
-static bool     s_last_lc3_valid[MESH_MAX_RIDERS];
 static uint32_t s_peer_mac_low[MESH_MAX_RIDERS];
 static uint16_t s_peer_quiet_sframes[MESH_MAX_RIDERS];
 
@@ -70,15 +68,23 @@ typedef enum {
 
 static volatile mesh_state_t s_state = MESH_S_IDLE;
 
-/* TX scratch — protected by s_tx_mtx */
+/* TX scratch — protected by s_tx_mtx.
+ *
+ * The mic encodes at 100 fps but a rider's slot only fires at 50 fps,
+ * so each packet ships up to two consecutive LC3 frames: the "newer"
+ * slot is what just arrived, "older" is the one before it. On TX we
+ * drain both into f.lc3 / f.lc3_prev and clear them. queue_tx shifts
+ * newer -> older then writes the new one to newer, so back-pressure
+ * sheds the oldest frame instead of the newest. */
 static SemaphoreHandle_t s_tx_mtx = NULL;
-static uint8_t s_pending_lc3[LC3_FRAME_BYTES];
-static bool    s_pending_valid    = false;
-static bool    s_pending_vad      = false;
-static bool    s_pending_leave    = false;
-static bool    s_pending_join     = false;
-static uint8_t s_prev_lc3[LC3_FRAME_BYTES];   /* F_{n-1} for FEC encode */
-static bool    s_prev_lc3_valid   = false;
+static uint8_t s_pending_older_lc3[LC3_FRAME_BYTES];
+static uint8_t s_pending_newer_lc3[LC3_FRAME_BYTES];
+static bool    s_pending_older_valid = false;
+static bool    s_pending_newer_valid = false;
+static bool    s_pending_older_vad   = false;
+static bool    s_pending_newer_vad   = false;
+static bool    s_pending_leave       = false;
+static bool    s_pending_join        = false;
 
 static TaskHandle_t s_tx_task_handle = NULL;
 static volatile bool s_task_should_exit = false;
@@ -150,8 +156,6 @@ esp_err_t mesh_mac_init(const uint8_t group_psk[16])
     /* Reset per-rider state. */
     memset(s_last_seq, 0, sizeof(s_last_seq));
     memset(s_seq_seen, 0, sizeof(s_seq_seen));
-    memset(s_last_lc3, 0, sizeof(s_last_lc3));
-    memset(s_last_lc3_valid, 0, sizeof(s_last_lc3_valid));
     memset(s_peer_mac_low, 0, sizeof(s_peer_mac_low));
     memset(s_peer_quiet_sframes, 0, sizeof(s_peer_quiet_sframes));
 
@@ -262,12 +266,11 @@ esp_err_t mesh_mac_join(uint8_t *out_slot)
         s_state    = MESH_S_JOINING_CLAIM;
         ESP_LOGI(TAG, "join attempt %d: claiming slot %d", attempt, slot);
 
-        /* Queue a JOIN frame for our next slot. */
+        /* Queue a JOIN flag for our next slot. The TX task already
+         * forces a send when JOIN/LEAVE/BEACON is set, so there's no
+         * need to pre-load a zero audio slot here. */
         xSemaphoreTake(s_tx_mtx, portMAX_DELAY);
-        s_pending_join  = true;
-        s_pending_valid = true;       /* even silent: we still TX a join */
-        s_pending_vad   = false;
-        memset(s_pending_lc3, 0, sizeof(s_pending_lc3));
+        s_pending_join = true;
         xSemaphoreGive(s_tx_mtx);
 
         /* Wait one superframe so the TX task actually sends our JOIN. */
@@ -302,7 +305,6 @@ esp_err_t mesh_mac_leave(void)
     if (s_state != MESH_S_JOINED) return ESP_OK;
     xSemaphoreTake(s_tx_mtx, portMAX_DELAY);
     s_pending_leave = true;
-    s_pending_valid = true;
     xSemaphoreGive(s_tx_mtx);
     /* Give the task one superframe to emit the LEAVE frame. */
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -322,9 +324,19 @@ esp_err_t mesh_mac_queue_tx(const uint8_t lc3_frame[30], bool vad_active)
          * tick, drop the frame. */
         return ESP_ERR_TIMEOUT;
     }
-    memcpy(s_pending_lc3, lc3_frame, LC3_FRAME_BYTES);
-    s_pending_valid = true;
-    s_pending_vad   = vad_active;
+    /* Shift newer -> older, then write the new arrival to newer. Under
+     * the normal 2-mic-ticks-per-slot cadence this fills both slots
+     * just in time for the TX task. If a third call lands before TX
+     * fires (back-pressure), the oldest frame is the one that gets
+     * dropped. */
+    if (s_pending_newer_valid) {
+        memcpy(s_pending_older_lc3, s_pending_newer_lc3, LC3_FRAME_BYTES);
+        s_pending_older_vad   = s_pending_newer_vad;
+        s_pending_older_valid = true;
+    }
+    memcpy(s_pending_newer_lc3, lc3_frame, LC3_FRAME_BYTES);
+    s_pending_newer_vad   = vad_active;
+    s_pending_newer_valid = true;
     xSemaphoreGive(s_tx_mtx);
     return ESP_OK;
 }
@@ -377,8 +389,7 @@ static void mesh_tx_task(void *arg)
         /* Build the frame. */
         mesh_frame_t f = (mesh_frame_t){0};
         f.rider_id   = s_own_slot;
-        f.flags      = MESH_PROTO_FLAG_FEC;   /* always carries XOR parity */
-        f.seq        = s_tx_seq++;
+        f.flags      = 0;
         f.superframe = s_superframe_counter;
 
         bool send_this_slot = false;
@@ -386,24 +397,35 @@ static void mesh_tx_task(void *arg)
         xSemaphoreTake(s_tx_mtx, portMAX_DELAY);
         if (s_pending_join)  { f.flags |= MESH_PROTO_FLAG_JOIN;  s_pending_join = false; }
         if (s_pending_leave) { f.flags |= MESH_PROTO_FLAG_LEAVE; s_pending_leave = false; }
-        if (s_pending_valid) {
-            if (s_pending_vad) f.flags |= MESH_PROTO_FLAG_VAD_ACTIVE;
-            memcpy(f.lc3, s_pending_lc3, LC3_FRAME_BYTES);
+        if (s_pending_newer_valid) {
+            /* Bundle up to two LC3 frames. f.seq names the current
+             * (newer) frame's seq; lc3_prev's implicit seq is f.seq-1.
+             * Bump s_tx_seq by 2 when both slots ship so wire seqs stay
+             * 1:1 with LC3 frames. */
+            memcpy(f.lc3, s_pending_newer_lc3, LC3_FRAME_BYTES);
+            if (s_pending_older_valid) {
+                memcpy(f.lc3_prev, s_pending_older_lc3, LC3_FRAME_BYTES);
+                f.flags |= MESH_PROTO_FLAG_LC3_PREV_VALID;
+                f.seq = s_tx_seq + 1;
+                s_tx_seq += 2;
+            } else {
+                f.seq = s_tx_seq;
+                s_tx_seq += 1;
+            }
+            if (s_pending_newer_vad ||
+                (s_pending_older_valid && s_pending_older_vad)) {
+                f.flags |= MESH_PROTO_FLAG_VAD_ACTIVE;
+            }
             send_this_slot = true;
         } else {
-            /* No audio queued — still TX a header-only frame if we have
-             * JOIN/LEAVE pending or we're the coordinator (beacon). */
-            memset(f.lc3, 0, LC3_FRAME_BYTES);
+            /* No audio queued — header-only frame. JOIN/LEAVE/BEACON
+             * or the always-send-while-joined rule below may still
+             * force a TX. */
+            f.seq = s_tx_seq;
+            s_tx_seq += 1;
         }
-        /* XOR-FEC against the previous frame we sent. */
-        if (s_prev_lc3_valid) {
-            mesh_proto_fec_encode(f.lc3, s_prev_lc3, f.fec);
-        } else {
-            memset(f.fec, 0, LC3_FRAME_BYTES);
-        }
-        memcpy(s_prev_lc3, f.lc3, LC3_FRAME_BYTES);
-        s_prev_lc3_valid = true;
-        s_pending_valid = false;
+        s_pending_older_valid = false;
+        s_pending_newer_valid = false;
         xSemaphoreGive(s_tx_mtx);
 
         /* Coordinator role: alternate slot-0 between beacon (even
@@ -415,10 +437,14 @@ static void mesh_tx_task(void *arg)
          * actual audio on the off-frames. */
         if (s_own_slot == 0 && we_hold_coordinator_role() &&
             (s_superframe_counter & 1u) == 0) {
+            /* Beacon overlays both lc3 + lc3_prev slots, so any audio
+             * the audio_io task queued for this slot is dropped on
+             * the floor (one of the known asymmetries — see
+             * docs/mesh_protocol.md). Clear the LC3_PREV_VALID flag
+             * because the lc3_prev bytes are beacon payload here. */
+            f.flags &= ~MESH_PROTO_FLAG_LC3_PREV_VALID;
             f.flags |= MESH_PROTO_FLAG_BEACON | MESH_PROTO_FLAG_VAD_ACTIVE;
             fill_beacon_payload(&f);
-            /* fec carries the second half of the beacon payload — no
-             * separate XOR computed in that case. */
             send_this_slot = true;
         }
 
@@ -478,7 +504,6 @@ static void mesh_tx_task(void *arg)
                 s_peer_mac_low[i] = 0;
                 s_peer_quiet_sframes[i] = 0;
                 s_seq_seen[i] = false;
-                s_last_lc3_valid[i] = false;
                 if (s_event_cb) s_event_cb(MESH_EVT_PEER_LEFT, (uint8_t)i);
             }
         }
@@ -539,8 +564,8 @@ static void on_esp_now_recv(const esp_now_recv_info_t *info,
         }
     }
 
-    uint16_t prev_seq = s_last_seq[rid];
     bool     had_seq  = s_seq_seen[rid];
+    uint16_t prev_last_seq = s_last_seq[rid];
     s_last_seq[rid] = f->seq;
     s_seq_seen[rid] = true;
     s_peer_quiet_sframes[rid] = 0;
@@ -579,33 +604,35 @@ static void on_esp_now_recv(const esp_now_recv_info_t *info,
         mesh_proto_slot_release(&s_slot_map, rid);
         s_peer_mac_low[rid] = 0;
         s_seq_seen[rid]     = false;
-        s_last_lc3_valid[rid] = false;
         if (s_event_cb) s_event_cb(MESH_EVT_PEER_LEFT, rid);
         return;
     }
 
-    /* FEC: if we just skipped exactly one frame (delta == 2) and the
-     * arriving frame has FEC set, try to reconstruct F_{n-1}. */
-    if (had_seq && (f->flags & MESH_PROTO_FLAG_FEC)) {
-        uint16_t delta = (uint16_t)(f->seq - prev_seq);
-        if (delta == 2) {
-            uint8_t recovered[LC3_FRAME_BYTES];
-            mesh_proto_fec_recover(f->lc3, f->fec, recovered);
-            if (s_rx_cb) {
-                s_rx_cb(rid,
-                        (f->flags & MESH_PROTO_FLAG_VAD_ACTIVE) != 0,
-                        recovered, LC3_FRAME_BYTES);
-            }
+    /* Deliver up to two LC3 frames per packet.
+     *
+     * The packet's f->seq is the seq of the current (newer) frame; the
+     * previous frame's seq is implicitly f->seq - 1.
+     *
+     * lc3_prev is delivered first (so the JB sees frames in seq order)
+     * iff (a) the sender flagged it valid AND (b) we haven't already
+     * pulled past it. Concretely: deliver iff prev_last_seq is older
+     * than (f->seq - 1) — i.e. we missed it in the prior packet — or
+     * this is the first packet we've seen from this rider.
+     *
+     * Anti-replay is already enforced on f->seq above; the JB at the
+     * receiver side will dedup if lc3_prev happens to duplicate
+     * something it already buffered. */
+    bool vad = (f->flags & MESH_PROTO_FLAG_VAD_ACTIVE) != 0;
+    if (s_rx_cb && (f->flags & MESH_PROTO_FLAG_LC3_PREV_VALID)) {
+        uint16_t prev_seq = (uint16_t)(f->seq - 1);
+        bool deliver_prev = !had_seq ||
+                            (int16_t)(prev_seq - prev_last_seq) > 0;
+        if (deliver_prev) {
+            s_rx_cb(rid, prev_seq, vad, f->lc3_prev, LC3_FRAME_BYTES);
         }
     }
-
-    /* Cache current lc3 for future FEC arithmetic. */
-    memcpy(s_last_lc3[rid], f->lc3, LC3_FRAME_BYTES);
-    s_last_lc3_valid[rid] = true;
-
-    /* Deliver this frame's audio if VAD-active. */
-    if ((f->flags & MESH_PROTO_FLAG_VAD_ACTIVE) && s_rx_cb) {
-        s_rx_cb(rid, true, f->lc3, LC3_FRAME_BYTES);
+    if (s_rx_cb && vad) {
+        s_rx_cb(rid, f->seq, true, f->lc3, LC3_FRAME_BYTES);
     }
 }
 
