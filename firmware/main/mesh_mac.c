@@ -68,23 +68,30 @@ typedef enum {
 
 static volatile mesh_state_t s_state = MESH_S_IDLE;
 
-/* TX scratch — protected by s_tx_mtx.
+/* TX ring — protected by s_tx_mtx.
  *
  * The mic encodes at 100 fps but a rider's slot only fires at 50 fps,
- * so each packet ships up to two consecutive LC3 frames: the "newer"
- * slot is what just arrived, "older" is the one before it. On TX we
- * drain both into f.lc3 / f.lc3_prev and clear them. queue_tx shifts
- * newer -> older then writes the new one to newer, so back-pressure
- * sheds the oldest frame instead of the newest. */
+ * and the two clocks (audio_io's I2S DMA vs mesh_tx's esp_timer) are
+ * independent — short-term phase drift means a naive 2-slot buffer
+ * sometimes has only 1 frame at TX time and sometimes has 3 arrive
+ * between TXes. We absorb that variance in a small FIFO: queue_tx
+ * appends to the head, TX consumes the two oldest unsent. With a
+ * 4-slot ring (= 40 ms of audio) and the long-term 2:1 mic:TX ratio,
+ * the ring stays under-full in steady state and overflow only kicks
+ * in under sustained back-pressure (eviction is FIFO — oldest goes). */
+#define MESH_TX_RING_SLOTS 4
+
+typedef struct {
+    uint8_t lc3[LC3_FRAME_BYTES];
+    bool    vad;
+} tx_ring_slot_t;
+
 static SemaphoreHandle_t s_tx_mtx = NULL;
-static uint8_t s_pending_older_lc3[LC3_FRAME_BYTES];
-static uint8_t s_pending_newer_lc3[LC3_FRAME_BYTES];
-static bool    s_pending_older_valid = false;
-static bool    s_pending_newer_valid = false;
-static bool    s_pending_older_vad   = false;
-static bool    s_pending_newer_vad   = false;
-static bool    s_pending_leave       = false;
-static bool    s_pending_join        = false;
+static tx_ring_slot_t    s_tx_ring[MESH_TX_RING_SLOTS];
+static uint8_t           s_tx_ring_head  = 0;  /* next write position    */
+static uint8_t           s_tx_ring_count = 0;  /* unsent frames in ring  */
+static bool              s_pending_leave = false;
+static bool              s_pending_join  = false;
 
 static TaskHandle_t s_tx_task_handle = NULL;
 static volatile bool s_task_should_exit = false;
@@ -158,6 +165,8 @@ esp_err_t mesh_mac_init(const uint8_t group_psk[16])
     memset(s_seq_seen, 0, sizeof(s_seq_seen));
     memset(s_peer_mac_low, 0, sizeof(s_peer_mac_low));
     memset(s_peer_quiet_sframes, 0, sizeof(s_peer_quiet_sframes));
+    s_tx_ring_head  = 0;
+    s_tx_ring_count = 0;
 
     if (s_tx_mtx == NULL) {
         s_tx_mtx = xSemaphoreCreateMutex();
@@ -324,19 +333,16 @@ esp_err_t mesh_mac_queue_tx(const uint8_t lc3_frame[30], bool vad_active)
          * tick, drop the frame. */
         return ESP_ERR_TIMEOUT;
     }
-    /* Shift newer -> older, then write the new arrival to newer. Under
-     * the normal 2-mic-ticks-per-slot cadence this fills both slots
-     * just in time for the TX task. If a third call lands before TX
-     * fires (back-pressure), the oldest frame is the one that gets
-     * dropped. */
-    if (s_pending_newer_valid) {
-        memcpy(s_pending_older_lc3, s_pending_newer_lc3, LC3_FRAME_BYTES);
-        s_pending_older_vad   = s_pending_newer_vad;
-        s_pending_older_valid = true;
+    if (s_tx_ring_count == MESH_TX_RING_SLOTS) {
+        /* Ring full — drop the oldest. The position to-be-written
+         * (s_tx_ring_head) currently holds the oldest entry; reducing
+         * the count by 1 logically removes it before we overwrite. */
+        s_tx_ring_count--;
     }
-    memcpy(s_pending_newer_lc3, lc3_frame, LC3_FRAME_BYTES);
-    s_pending_newer_vad   = vad_active;
-    s_pending_newer_valid = true;
+    memcpy(s_tx_ring[s_tx_ring_head].lc3, lc3_frame, LC3_FRAME_BYTES);
+    s_tx_ring[s_tx_ring_head].vad = vad_active;
+    s_tx_ring_head = (uint8_t)((s_tx_ring_head + 1) % MESH_TX_RING_SLOTS);
+    s_tx_ring_count++;
     xSemaphoreGive(s_tx_mtx);
     return ESP_OK;
 }
@@ -397,25 +403,31 @@ static void mesh_tx_task(void *arg)
         xSemaphoreTake(s_tx_mtx, portMAX_DELAY);
         if (s_pending_join)  { f.flags |= MESH_PROTO_FLAG_JOIN;  s_pending_join = false; }
         if (s_pending_leave) { f.flags |= MESH_PROTO_FLAG_LEAVE; s_pending_leave = false; }
-        if (s_pending_newer_valid) {
-            /* Bundle up to two LC3 frames. f.seq names the current
-             * (newer) frame's seq; lc3_prev's implicit seq is f.seq-1.
-             * Bump s_tx_seq by 2 when both slots ship so wire seqs stay
-             * 1:1 with LC3 frames. */
-            memcpy(f.lc3, s_pending_newer_lc3, LC3_FRAME_BYTES);
-            if (s_pending_older_valid) {
-                memcpy(f.lc3_prev, s_pending_older_lc3, LC3_FRAME_BYTES);
+        if (s_tx_ring_count > 0) {
+            /* Bundle the two oldest unsent. f.seq names the newer of
+             * the two (or the only one); lc3_prev's implicit seq is
+             * f.seq-1. s_tx_seq stays 1:1 with LC3 frames. */
+            uint8_t oldest = (uint8_t)((s_tx_ring_head
+                                        + MESH_TX_RING_SLOTS
+                                        - s_tx_ring_count)
+                                       % MESH_TX_RING_SLOTS);
+            bool vad_union = s_tx_ring[oldest].vad;
+            if (s_tx_ring_count >= 2) {
+                uint8_t newer = (uint8_t)((oldest + 1) % MESH_TX_RING_SLOTS);
+                memcpy(f.lc3_prev, s_tx_ring[oldest].lc3, LC3_FRAME_BYTES);
+                memcpy(f.lc3,      s_tx_ring[newer].lc3,  LC3_FRAME_BYTES);
+                vad_union = vad_union || s_tx_ring[newer].vad;
                 f.flags |= MESH_PROTO_FLAG_LC3_PREV_VALID;
                 f.seq = s_tx_seq + 1;
                 s_tx_seq += 2;
+                s_tx_ring_count -= 2;
             } else {
+                memcpy(f.lc3, s_tx_ring[oldest].lc3, LC3_FRAME_BYTES);
                 f.seq = s_tx_seq;
                 s_tx_seq += 1;
+                s_tx_ring_count -= 1;
             }
-            if (s_pending_newer_vad ||
-                (s_pending_older_valid && s_pending_older_vad)) {
-                f.flags |= MESH_PROTO_FLAG_VAD_ACTIVE;
-            }
+            if (vad_union) f.flags |= MESH_PROTO_FLAG_VAD_ACTIVE;
             send_this_slot = true;
         } else {
             /* No audio queued — header-only frame. JOIN/LEAVE/BEACON
@@ -424,8 +436,6 @@ static void mesh_tx_task(void *arg)
             f.seq = s_tx_seq;
             s_tx_seq += 1;
         }
-        s_pending_older_valid = false;
-        s_pending_newer_valid = false;
         xSemaphoreGive(s_tx_mtx);
 
         /* Coordinator role: alternate slot-0 between beacon (even
