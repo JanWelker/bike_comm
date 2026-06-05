@@ -96,8 +96,27 @@ extern void mesh_rx_drain_to_mixer(void);
 
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
+#include "esp_timer.h"
+
+#include "noise_suppression.h"
 
 static const char *TAG = "audio";
+
+/* WebRTC_NS state — allocated in audio_pipeline_start. The struct is
+ * ~20-25 KB so it goes to PSRAM by default (above our 16 KB
+ * SPIRAM_MALLOC_ALWAYSINTERNAL threshold). NS only runs once per
+ * 10 ms tick, not in an ISR, so PSRAM latency is fine here.
+ *
+ * Mode: 1 = Medium (10 dB attenuation). Mild misses too much
+ * background; Aggressive eats consonants. */
+static NsHandle *s_ns = NULL;
+
+/* Per-call wall-clock perf counters for WebRtcNs_Process, in the same
+ * shape as codec_lc3's counters. Logged + reset every 1000 frames by
+ * codec_lc3_perf_log_and_reset's neighbor below. */
+static int64_t  s_ns_us_sum = 0;
+static int64_t  s_ns_us_max = 0;
+static uint32_t s_ns_count  = 0;
 
 /* ---- Board pinout (LyraT-Mini v1.2) ---- */
 #define I2C_SDA_GPIO            GPIO_NUM_18
@@ -219,6 +238,23 @@ void audio_pipeline_start(void)
     /* Speaker amp must be high to actually hear anything. */
     gpio_set_level(PA_ENABLE_GPIO, 1);
     ESP_LOGI(TAG, "PA enable high");
+
+    /* Bring up WebRTC noise suppression. Allocated here (after
+     * mesh_mac_start has grabbed its DRAM task stack in app_main)
+     * so the ~25 KB NS state goes to PSRAM via the default IDF
+     * malloc above the 16 KB internal-RAM threshold. */
+    s_ns = WebRtcNs_Create();
+    ESP_ERROR_CHECK(s_ns ? ESP_OK : ESP_ERR_NO_MEM);
+    if (WebRtcNs_Init(s_ns, AUDIO_SR_HZ) != 0) {
+        ESP_LOGE(TAG, "WebRtcNs_Init failed");
+        abort();
+    }
+    /* Mode 1 = Medium (10 dB attenuation). */
+    if (WebRtcNs_set_policy(s_ns, 1) != 0) {
+        ESP_LOGE(TAG, "WebRtcNs_set_policy failed");
+        abort();
+    }
+    ESP_LOGI(TAG, "WebRTC_NS up (mode=medium, %d Hz)", AUDIO_SR_HZ);
 
     s_running = true;
     /* 4 KB overflows once LC3 encode + cross-core mesh mutex enter the
@@ -511,10 +547,19 @@ static void loopback_task(void *arg)
             }
         }
 #endif /* AUDIO_DIAG_MIC_LEVEL */
-        /* v0 mesh-audio: send the local mic + drain remote frames into
-         * the mixer. The mixer pull is still gated below because that
-         * specific call surfaces a crash/regression we haven't fully
-         * unpacked yet — see the comment above the playback block. */
+        /* Noise suppression in place between the mic capture and the
+         * LC3 encode. WebRTC_NS operates on 10 ms / 160-sample int16
+         * blocks at 16 kHz — same cadence as our LC3 frame, so this
+         * is a single in-place-style call per mic frame. */
+        int16_t *ns_in[1]  = { buf };
+        int16_t *ns_out[1] = { buf };
+        int64_t ns_t0 = esp_timer_get_time();
+        WebRtcNs_Process(s_ns, (const int16_t *const *)ns_in, 1, ns_out);
+        int64_t ns_dt = esp_timer_get_time() - ns_t0;
+        s_ns_us_sum += ns_dt;
+        if (ns_dt > s_ns_us_max) s_ns_us_max = ns_dt;
+        s_ns_count++;
+
         codec_lc3_encode(buf, lc3_buf);
         mesh_mac_queue_tx(lc3_buf, /*vad_active=*/true);
         mesh_rx_drain_to_mixer();
@@ -539,12 +584,19 @@ static void loopback_task(void *arg)
             }
         }
 #endif
-        /* LC3 wall-clock perf log every 1000 frames (~10 s). Numbers
-         * land in docs/codec_perf.md. */
+        /* LC3 + NS wall-clock perf log every 1000 frames (~10 s).
+         * Numbers land in docs/codec_perf.md. */
         {
             static uint32_t s_perf_n = 0;
             if ((++s_perf_n % 1000) == 0) {
                 codec_lc3_perf_log_and_reset();
+                if (s_ns_count > 0) {
+                    ESP_LOGI(TAG, "ns: n=%u mean=%lld us max=%lld us",
+                             (unsigned)s_ns_count,
+                             (long long)(s_ns_us_sum / (int64_t)s_ns_count),
+                             (long long)s_ns_us_max);
+                    s_ns_us_sum = 0; s_ns_us_max = 0; s_ns_count = 0;
+                }
             }
         }
         int rc_w = esp_codec_dev_write(s_spk_dev, spk_buf, LOOPBACK_FRAME_BYTES);

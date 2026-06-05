@@ -95,11 +95,12 @@ mesh_proto layout-size assertion has caught silent rot before.
   2.4.6's precompiled `ns_process` for ESP32 calls
   `heap_caps_check_integrity_all` and crashes walking our heap; older
   2.0.5 doesn't have the check but exhausts internal DRAM and OOMs
-  the audio task. The vendoring path forward (verified 2026-06) is
-  `cpuimage/WebRTC_NS` — BSD-3, single-TU float32 C, int16 PCM API,
-  10 ms / 160-sample blocks that map 1:1 to our LC3 cadence. ~20-25
-  KB RAM per instance, float-FFT cost on LX6 (no PIE) needs measure-
-  ment against the audio_io DRAM budget before integration.
+  the audio task. We use `cpuimage/WebRTC_NS` instead (vendored at
+  `firmware/components/webrtc_ns/`) — BSD-3, single-TU float32 C,
+  10 ms / 160-sample blocks that map 1:1 to our LC3 cadence. State
+  is ~25 KB and lands in PSRAM via the default 16 KB threshold;
+  measured cost on LX6 is ~1.5 ms per 10 ms frame (see
+  `docs/codec_perf.md`).
 - **The app partition is ~99% full.** Each OTA slot is 0x1C0000
   (1.75 MB) and the current binary fills nearly all of it — adding
   any managed component over ~30 KB will overflow. There's a 380 KB
@@ -175,9 +176,13 @@ dir.
 - [x] **Lock `WIFI_MODE_STA` at boot.** Done; assertion in
   `platform_init`. See gotcha above.
 - [x] **Measure LC3 cost on LX6.** Done; see `docs/codec_perf.md`.
-- [ ] **Vendor `cpuimage/WebRTC_NS` as the NS module.** Replaces the
-  dead esp-sr path. 1-2 days integration + 1 day profiling. Watch
-  DRAM (~20-25 KB per instance) and float-FFT CPU on LX6.
+- [x] **Vendor `cpuimage/WebRTC_NS` as the NS module.** Done; lives
+  at `firmware/components/webrtc_ns/`, wired into `loopback_task`
+  between mic read and LC3 encode (mode = medium). Measured ~1.5 ms
+  per 10 ms frame on LX6; required a partition resize (OTA slots
+  bumped 1.75 → 1.875 MB) to fit. With NS landed the audio_io tick
+  sits at ~7.4 ms of 10 ms at 2 riders — further DSP additions will
+  need to live on the other core. See `docs/codec_perf.md`.
 - [ ] **Adopt `Hemisphere-Project/ESPNowMeshClock`'s forward-only-
   slewed time-sync algorithm** for beacon resync. GPL-3.0 — license
   review before vendoring; reimplementing the algorithm is also

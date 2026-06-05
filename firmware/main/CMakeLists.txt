@@ -26,4 +26,5 @@ idf_component_register(
         esp_timer
         liblc3
         esp_codec_dev
+        webrtc_ns
 )
