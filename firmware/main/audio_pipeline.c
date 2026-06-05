@@ -118,6 +118,23 @@ static int64_t  s_ns_us_sum = 0;
 static int64_t  s_ns_us_max = 0;
 static uint32_t s_ns_count  = 0;
 
+/* VAD gate. WebRTC NS already computes a prior speech probability as
+ * part of its noise estimate; we ride along on it instead of running
+ * a separate VAD. Above-threshold frames are "speech"; we then hold
+ * the gate open for VAD_HOLD_FRAMES (= 500 ms at 100 fps) so word-
+ * internal pauses don't toggle the wire bit. The output drives the
+ * vad_active flag on mesh_mac_queue_tx — the receiver-side mixer
+ * already honours the bit (it skips decode on VAD-inactive frames),
+ * so this is a free CPU saving on RX. It does NOT yet skip TX of
+ * silent slots; that'd break the 200 ms peer-quiet-timeout and needs
+ * a heartbeat scheme — separate TODO. */
+#define VAD_SPEECH_THRESHOLD   0.5f
+#define VAD_HOLD_FRAMES        50
+
+static int      s_vad_hold          = 0;
+static uint32_t s_vad_active_count  = 0;
+static uint32_t s_vad_total_count   = 0;
+
 /* ---- Board pinout (LyraT-Mini v1.2) ---- */
 #define I2C_SDA_GPIO            GPIO_NUM_18
 #define I2C_SCL_GPIO            GPIO_NUM_23
@@ -560,8 +577,23 @@ static void loopback_task(void *arg)
         if (ns_dt > s_ns_us_max) s_ns_us_max = ns_dt;
         s_ns_count++;
 
+        /* VAD via WebRTC NS's internal speech probability + hold. */
+        float speech_prob = WebRtcNs_prior_speech_probability(s_ns);
+        bool vad_active;
+        if (speech_prob > VAD_SPEECH_THRESHOLD) {
+            vad_active = true;
+            s_vad_hold = VAD_HOLD_FRAMES;
+        } else if (s_vad_hold > 0) {
+            vad_active = true;
+            s_vad_hold--;
+        } else {
+            vad_active = false;
+        }
+        s_vad_total_count++;
+        if (vad_active) s_vad_active_count++;
+
         codec_lc3_encode(buf, lc3_buf);
-        mesh_mac_queue_tx(lc3_buf, /*vad_active=*/true);
+        mesh_mac_queue_tx(lc3_buf, vad_active);
         mesh_rx_drain_to_mixer();
 
         mixer_pull(spk_buf, aec_ref);
@@ -584,7 +616,7 @@ static void loopback_task(void *arg)
             }
         }
 #endif
-        /* LC3 + NS wall-clock perf log every 1000 frames (~10 s).
+        /* LC3 + NS + VAD diagnostic log every 1000 frames (~10 s).
          * Numbers land in docs/codec_perf.md. */
         {
             static uint32_t s_perf_n = 0;
@@ -596,6 +628,15 @@ static void loopback_task(void *arg)
                              (long long)(s_ns_us_sum / (int64_t)s_ns_count),
                              (long long)s_ns_us_max);
                     s_ns_us_sum = 0; s_ns_us_max = 0; s_ns_count = 0;
+                }
+                if (s_vad_total_count > 0) {
+                    ESP_LOGI(TAG, "vad: %u/%u frames active (%u%%)",
+                             (unsigned)s_vad_active_count,
+                             (unsigned)s_vad_total_count,
+                             (unsigned)((100u * s_vad_active_count) /
+                                        s_vad_total_count));
+                    s_vad_active_count = 0;
+                    s_vad_total_count  = 0;
                 }
             }
         }

@@ -190,18 +190,20 @@ dir.
   step threshold = 5 ms. First beacon snaps the joiner's clock to the
   coord's; subsequent ones slew silently. Verified: rx-drain rates
   stay at ~100/75 fps after lock.
-- [ ] **VAD-gate the TX path so we don't transmit silence.** Today
-  `audio_pipeline.c` hard-codes `vad_active=true` in every
-  `mesh_mac_queue_tx` call, so we burn airtime + power broadcasting
-  noise floor 100 fps even when nobody's speaking. The receiver
-  already honours the VAD bit on the wire (since commit `e0e1ac8`)
-  and the mixer skips decode on VAD-inactive frames; we just need a
-  real source for the bit. Options: (a) ride along on
-  `cpuimage/WebRTC_NS`'s internal voice-probability — `WebRtcNs_
-  prior_speech_probability` is already exposed by our vendored copy
-  and costs zero extra CPU; (b) energy-threshold heuristic from the
-  current mic_level diagnostic; (c) wait for SpeexDSP vendoring to
-  bring proper webrtc-vad. (a) is the cheap right answer. 0.5 day.
+- [x] **VAD-gate the TX path so the wire bit is real.** Done; we
+  ride on `WebRtcNs_prior_speech_probability` (already linked via
+  the WebRTC_NS vendoring) with a 0.5 probability threshold and a
+  50-frame (500 ms) hold so word-internal pauses don't toggle the
+  bit. Receiver-side win is large: B1 (coord) decode-call count
+  dropped from ~1000/10s to 15-57/10s in a quiet room, since the
+  mixer skips decode on VAD-inactive frames.
+- [ ] **Stop transmitting during silence (actual airtime save).**
+  Phase-1 VAD gating (above) sets the bit correctly but we still TX
+  a packet every superframe — the slot-claim invariant (peer
+  quiet-timeout = 10 sframes / 200 ms) requires it. Real airtime
+  savings need a heartbeat scheme: skip TX while VAD-inactive,
+  send a single keepalive every K superframes (K < 10). Helps BT
+  Classic coex more than CPU. ~0.5 day.
 - [ ] **Add Codec2 as a build-time alternate codec behind Kconfig.**
   Source: `M17-Project/codec2` + `onemikedelta/M17-ESP32` (LX6 proof
   via `sh123/esp32_loradv`). 8 B/20 ms frames are 5x smaller than
