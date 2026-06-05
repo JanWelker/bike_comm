@@ -11,7 +11,6 @@
 #include "esp_log.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
-#include "esp_bt_device.h"
 #include "esp_gap_bt_api.h"
 
 static const char *TAG = "bt";
@@ -28,7 +27,7 @@ esp_err_t bt_classic_init(void)
 {
     ESP_LOGI(TAG, "init (HFP-HF + A2DP-sink)");
 
-    esp_bt_dev_set_device_name("bike_comm");
+    esp_bt_gap_set_device_name("bike_comm");
     /* TODO:
      *   - esp_bt_gap_register_callback(gap_cb)
      *   - esp_hf_client_register_callback / esp_hf_client_init

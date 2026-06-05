@@ -1,0 +1,42 @@
+# clangd configuration for the bike_comm ESP-IDF firmware.
+#
+# clangd is the IDE language server, not the compiler. The actual build
+# uses xtensa-esp32-elf-gcc (esp-idf v5.5.4). compile_commands.json that
+# CMake generates passes xtensa-specific flags that clangd's LLVM/Clang
+# frontend doesn't recognize, plus references newlib headers in the
+# xtensa toolchain sysroot that LLVM can't find. The result is a flood
+# of false-positive diagnostics in the editor that have nothing to do
+# with real code issues.
+#
+# This config:
+#   1. Strips the unrecognized GCC/Xtensa-only flags so clangd can finish
+#      parsing the command line instead of bailing.
+#   2. Silences diagnostics that come from sysroot-misses and from
+#      FreeRTOS / ESP-IDF macros (pdMS_TO_TICKS, WIFI_INIT_CONFIG_DEFAULT,
+#      etc.) that clangd cannot fully expand without xtensa headers.
+#   3. Turns off the IncludeCleaner suggestions, which constantly fire
+#      on transitively-needed ESP-IDF headers.
+#
+# Anything clangd still flags after this is more likely to be a real
+# C/C++ issue. The actual compiler build (idf.py build) is the source
+# of truth for warnings/errors.
+
+CompileFlags:
+  Remove:
+    - -mlongcalls
+    - -mdisable-hardware-atomics
+    - -mfix-esp32-psram-cache-issue
+    - -mfix-esp32-psram-cache-strategy=*
+    - -fno-shrink-wrap
+    - -fstrict-volatile-bitfields
+    - -fno-tree-switch-conversion
+
+Diagnostics:
+  UnusedIncludes: None
+  MissingIncludes: None
+  Suppress:
+    - pp_file_not_found        # newlib headers in xtensa sysroot (sys/reent.h, etc.)
+    - drv_unknown_argument     # any remaining unknown xtensa-specific flag
+    - drv_unknown_argument_with_suggestion
+    - invalid_suffix_constant  # FreeRTOS / ESP-IDF macro lexing artifacts
+    - lexing_numeric           # same
