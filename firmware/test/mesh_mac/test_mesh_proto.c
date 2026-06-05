@@ -167,9 +167,9 @@ TEST(test_coord_we_lose_to_lower_peer)
 TEST(test_wire_layout_sizes)
 {
     /* These are also _Static_asserts in the header, but re-check at
-     * runtime for documentation. */
-    assert(sizeof(mesh_frame_t)  == 68);
-    assert(sizeof(mesh_beacon_t) == 60);
+     * runtime for documentation. Tied to 32 kbps LC3 (40 B frame). */
+    assert(sizeof(mesh_frame_t)  == 88);
+    assert(sizeof(mesh_beacon_t) == 40);
 }
 
 /* ------------------------------------------------------------------ */

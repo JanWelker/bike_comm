@@ -31,7 +31,7 @@ esp_err_t mixer_init(void);
  *                 active. When false, the mixer skips LC3 decode for
  *                 this slot (treats it as silence) to save CPU.
  *   lc3         — payload bytes
- *   len         — payload length (expected = LC3_FRAME_BYTES = 30)
+ *   len         — payload length (expected = LC3_FRAME_BYTES = 40)
  *
  * NOTE: signature changed in v0.x — was `(rider_id, lc3, len)`. The
  * mesh RX callback in mesh_mac must pass seq + vad through. */

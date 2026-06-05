@@ -18,9 +18,9 @@
  * must not pull in esp_err.h). ----------------------------------- */
 
 #define MESH_PROTO_MAX_RIDERS         8
-#define MESH_PROTO_LC3_BYTES          30
-#define MESH_PROTO_FRAME_BYTES        68          /* full on-air frame   */
-#define MESH_PROTO_CRC_COVER_BYTES    66          /* bytes 0..65         */
+#define MESH_PROTO_LC3_BYTES          40
+#define MESH_PROTO_FRAME_BYTES        88          /* full on-air frame   */
+#define MESH_PROTO_CRC_COVER_BYTES    86          /* bytes 0..85         */
 #define MESH_PROTO_REPLAY_WINDOW      16          /* 2 superframes worth */
 
 /* Flags bitfield (mirrors mesh_mac.h; defined here so host tests don't
@@ -53,9 +53,9 @@ typedef struct __attribute__((packed)) {
 } mesh_frame_t;
 
 _Static_assert(sizeof(mesh_frame_t) == MESH_PROTO_FRAME_BYTES,
-               "mesh_frame_t must be 68 bytes on the wire");
+               "mesh_frame_t must equal MESH_PROTO_FRAME_BYTES on the wire");
 
-/* ---- beacon payload — overlays the lc3_prev slot (offset 36 .. 65)
+/* ---- beacon payload — overlays the lc3_prev slot (offset 46 .. 85)
  * when MESH_PROTO_FLAG_BEACON is set. The lc3 slot stays free for
  * audio, letting the coordinator transmit one mic frame on every
  * beacon-bearing slot 0 instead of going silent. LC3_PREV_VALID is
@@ -67,11 +67,11 @@ typedef struct __attribute__((packed)) {
     uint32_t us_timestamp;                        /* coord esp_timer mod 2^32 */
     uint8_t  slot_map;                            /* bit i = slot i claimed   */
     uint8_t  group_version;                       /* bumped on PSK/schema     */
-    uint8_t  reserved[19];                        /* zeros, future use        */
+    uint8_t  reserved[29];                        /* zeros, future use        */
 } mesh_beacon_t;
 
 _Static_assert(sizeof(mesh_beacon_t) == MESH_PROTO_LC3_BYTES,
-               "mesh_beacon_t must fit in lc3_prev space (30 B)");
+               "mesh_beacon_t must fit in lc3_prev space (= LC3 frame size)");
 
 /* ---- CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflect) ---- */
 

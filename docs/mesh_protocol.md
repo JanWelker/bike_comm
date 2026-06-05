@@ -17,14 +17,14 @@ Custom TDMA on top of ESP-NOW. Single-hop, flat broadcast, up to 8 riders.
 
 | | |
 |---|---|
-| LC3 frame F_n (24 kbps, 10 ms) | 30 B |
-| LC3 frame F_{n-1} (the prior 10 ms) | 30 B |
+| LC3 frame F_n (32 kbps, 10 ms) | 40 B |
+| LC3 frame F_{n-1} (the prior 10 ms) | 40 B |
 | Header (rider, flags, seq, sframe_ctr, CRC) | 8 B |
 | ESP-NOW + Wi-Fi overhead | ~22 B |
-| **Total on air** | ~90 B |
-| Airtime @ 1 Mbps PHY | ~0.7 ms |
+| **Total on air** | ~110 B |
+| Airtime @ 1 Mbps PHY | ~0.9 ms |
 | Slot duration | 2.5 ms |
-| Guard window | ~1.5 ms |
+| Guard window | ~1.3 ms |
 
 Two LC3 frames per packet covers the mic's 100 fps encode rate at the
 slot's 50 fps cadence — see "Two LC3 frames per packet" below.
@@ -33,7 +33,7 @@ Crystal drift over 20 ms at ±20 ppm = ±0.4 µs. Guard absorbs it with ~1000× 
 
 ## Wire format
 
-68 bytes payload (within the 250 B ESP-NOW MTU).
+88 bytes payload (within the 250 B ESP-NOW MTU). LC3 frames are 40 B each at 32 kbps.
 
 ```
 offset  size  field
@@ -42,31 +42,31 @@ offset  size  field
    2     2    seq             (per-rider monotonic; seq of lc3 — lc3_prev's
                                implicit seq is seq - 1)
    4     2    superframe_ctr  (coordinator-broadcast; receivers track delta)
-   6    30    lc3             (current 10 ms voice, F_n)
-  36    30    lc3_prev        (prior 10 ms voice, F_{n-1}; gated by the
+   6    40    lc3             (current 10 ms voice, F_n)
+  46    40    lc3_prev        (prior 10 ms voice, F_{n-1}; gated by the
                                LC3_PREV_VALID flag — cleared on first packet
                                from a rider and on BEACON frames where this
                                area carries beacon payload instead)
-  66     2    crc16           (CRC-16/CCITT over bytes 0..65)
+  86     2    crc16           (CRC-16/CCITT over bytes 0..85)
 ```
 
 The CRC is a defense against firmware bugs, not adversaries — see the Security section for the encryption story (short version: v0 ships unencrypted, see below).
 
 ## Beacon
 
-When `flags & BEACON`, the `lc3_prev` slot (offset 36..65) instead carries:
+When `flags & BEACON`, the `lc3_prev` slot (offset 46..85) instead carries:
 
 ```
 offset  size  field
-  36     1    BEACON_MAGIC    (0xB1)
-  37     4    coord_mac_low   (lowest 4 bytes of coordinator MAC)
-  41     4    us_timestamp    (esp_timer_get_time() at TX start, modulo 2^32)
-  45     1    slot_map        (bit i = 1 if slot i is claimed)
-  46     1    group_version   (bumped on PSK change, schema change, etc.)
-  47    19    reserved (zeros, for future fields)
+  46     1    BEACON_MAGIC    (0xB1)
+  47     4    coord_mac_low   (lowest 4 bytes of coordinator MAC)
+  51     4    us_timestamp    (esp_timer_get_time() at TX start, modulo 2^32)
+  55     1    slot_map        (bit i = 1 if slot i is claimed)
+  56     1    group_version   (bumped on PSK change, schema change, etc.)
+  57    29    reserved (zeros, for future fields)
 ```
 
-`LC3_PREV_VALID` is always cleared on beacon frames (those 30 B are beacon, not audio). The `lc3` slot still carries one audio frame, so the coordinator transmits one mic frame on every beacon-bearing slot 0 instead of going silent.
+`LC3_PREV_VALID` is always cleared on beacon frames (those 40 B are beacon, not audio). The `lc3` slot still carries one audio frame, so the coordinator transmits one mic frame on every beacon-bearing slot 0 instead of going silent.
 
 Slot 0 alternates between beacon (even superframes) and audio (odd superframes). Beacon rate is 25 fps (one beacon every 40 ms); the coordinator-loss timer (10 superframes ≈ 200 ms) tolerates the wider gap. Coordinator audio rate is 75 fps (25 beacon-slot frames + 50 audio-slot frames per second) — see the asymmetry note below.
 
@@ -116,11 +116,11 @@ loses at most 10 ms of audio (where the prior design lost a full
 
 The previous XOR-parity FEC slot bought partial recovery of F_{n-1}
 from a single packet loss; carrying F_{n-1} directly is strictly
-better at the same 30 B cost.
+better at the same 40 B cost.
 
 Asymmetry note: the coordinator's slot 0 alternates beacon and audio
 (see "Beacon"). Audio slots carry 2 frames; beacon slots carry 1
-(the other 30 B is beacon payload). Net coordinator audio rate is
+(the other 40 B is beacon payload). Net coordinator audio rate is
 ~75 fps over the wire vs ~100 fps for joiners — the missing 25 fps
 is the one mic frame per beacon slot that doesn't fit. The TX ring
 evicts oldest under that sustained back-pressure, so the lost frame
@@ -143,6 +143,6 @@ Voice frames are loss-tolerant; late frames are useless. Retransmission would bl
 
 ## Open issues (revisit during build)
 
-1. **Beacon piggyback eating slot 0 audio** — the 30 B beacon fits in lc3_prev, so beacon slots still carry one audio frame in lc3, bringing the coordinator to 75 fps (vs joiners' 100 fps). The remaining 25 fps gap needs either a dedicated 9th beacon slot (shrinks each audio slot to ~2.22 ms — math still works) or a 4-LC3-frame bundle on coordinator audio slots (wider on-air frame, still within MTU). Pick when the asymmetry becomes audibly meaningful.
+1. **Beacon piggyback eating slot 0 audio** — the 40 B beacon fits in lc3_prev, so beacon slots still carry one audio frame in lc3, bringing the coordinator to 75 fps (vs joiners' 100 fps). The remaining 25 fps gap needs either a dedicated 9th beacon slot (shrinks each audio slot to ~2.22 ms — math still works) or a 4-LC3-frame bundle on coordinator audio slots (wider on-air frame, still within MTU). Pick when the asymmetry becomes audibly meaningful.
 2. **Collision detection during JOIN** — we infer collision from "next beacon didn't add our bit." A more robust scheme listens to other riders' RSSI of our own JOIN — TBD on bench.
 3. **Multi-hop** — explicitly deferred to v2.

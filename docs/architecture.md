@@ -22,7 +22,7 @@ The single-radio coexistence between BT Classic and ESP-NOW is the central risk 
 App / UX          buttons, LED, NVS, OTA
 Session FSM       intercom ↔ phone-call arbitration
 Mixer + JB        N jitter buffers, decode pool, sum to speaker + AEC ref
-LC3 codec         google/liblc3 — 24 kbps, 10 ms, 16 kHz
+LC3 codec         google/liblc3 — 32 kbps, 10 ms, 16 kHz
 ESP-SR AFE        AEC + NS + VAD
 I2S audio I/O     INMP441 in, ES8388 out
 Transport         ESP-NOW MAC (TDMA), Bluedroid HFP+A2DP
@@ -35,7 +35,7 @@ Platform          FreeRTOS, NVS, coex
 |---|---|
 | Sample rate | 16 kHz mono |
 | Frame size | 10 ms = 160 samples |
-| LC3 bitrate | 24 kbps -> 30 B/frame |
+| LC3 bitrate | 32 kbps -> 40 B/frame |
 | Mouth-to-ear target | ≤ 200 ms |
 | AEC reference | mixer output (not just phone audio) |
 

@@ -35,7 +35,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the design,
 - ESP-IDF v5.5.4, FreeRTOS.
 - `esp_codec_dev` managed component for ES8311 + ES7243 control.
 - `google/liblc3` v1.1.1 (vendored) for the voice codec at 16 kHz / 10 ms
-  / 24 kbps.
+  / 32 kbps.
 - Custom TDMA MAC over ESP-NOW for the mesh (20 ms superframe, 8 slots).
 - Bluedroid for BT Classic HFP-HF + A2DP-sink (planned, not yet wired).
 - ESP-SR AFE for AEC + NS + VAD (planned, not yet wired).

@@ -1,5 +1,5 @@
 /*
- * codec_lc3 — wraps google/liblc3 for 16 kHz / 10 ms / 24 kbps voice.
+ * codec_lc3 — wraps google/liblc3 for 16 kHz / 10 ms / 32 kbps voice.
  *
  * One shared encoder; one decoder instance per active remote rider
  * (allocated lazily from a pool when the rider first transmits a
@@ -16,10 +16,10 @@
 #include <stddef.h>
 #include "esp_err.h"
 
-#define LC3_BITRATE_BPS    24000
+#define LC3_BITRATE_BPS    32000
 #define LC3_FRAME_DUR_US   10000
 #define LC3_SAMPLE_RATE_HZ 16000
-#define LC3_FRAME_BYTES    30        /* derived from bitrate and frame duration */
+#define LC3_FRAME_BYTES    40        /* derived from bitrate and frame duration */
 #define LC3_PCM_SAMPLES    160       /* 10 ms @ 16 kHz */
 #define LC3_MAX_DECODERS   8         /* one per rider in an 8-rider mesh */
 

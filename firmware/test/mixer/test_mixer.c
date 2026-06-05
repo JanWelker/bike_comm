@@ -30,14 +30,14 @@ static int tests_passed = 0;
     } while (0)
 
 /* Convenience: build a payload that encodes its seq for verification. */
-static void make_payload(uint8_t out[30], uint16_t seq)
+static void make_payload(uint8_t out[MIXER_JB_LC3_BYTES], uint16_t seq)
 {
-    memset(out, 0, 30);
+    memset(out, 0, MIXER_JB_LC3_BYTES);
     out[0] = (uint8_t)(seq & 0xFF);
     out[1] = (uint8_t)((seq >> 8) & 0xFF);
 }
 
-static uint16_t payload_seq(const uint8_t buf[30])
+static uint16_t payload_seq(const uint8_t buf[MIXER_JB_LC3_BYTES])
 {
     return (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
 }
@@ -52,17 +52,17 @@ static void test_jb_in_order(void)
     mixer_jb_t jb;
     mixer_jb_init(&jb);
 
-    uint8_t p[30];
+    uint8_t p[MIXER_JB_LC3_BYTES];
     for (uint16_t s = 1; s <= 3; s++) {
         make_payload(p, s);
-        mixer_jb_push(&jb, s, true, p, 30);
+        mixer_jb_push(&jb, s, true, p, MIXER_JB_LC3_BYTES);
     }
 
-    uint8_t out[30]; uint8_t len; bool vad;
+    uint8_t out[MIXER_JB_LC3_BYTES]; uint8_t len; bool vad;
     bool ok;
 
     ok = mixer_jb_pull(&jb, out, &len, &vad);
-    CHECK(ok && len == 30 && vad && payload_seq(out) == 1, "pull 1");
+    CHECK(ok && len == MIXER_JB_LC3_BYTES && vad && payload_seq(out) == 1, "pull 1");
 
     ok = mixer_jb_pull(&jb, out, &len, &vad);
     CHECK(ok && payload_seq(out) == 2, "pull 2");
@@ -80,14 +80,14 @@ static void test_jb_out_of_order(void)
     mixer_jb_t jb;
     mixer_jb_init(&jb);
 
-    uint8_t p[30];
+    uint8_t p[MIXER_JB_LC3_BYTES];
     uint16_t order[] = { 3, 1, 2 };
     for (int i = 0; i < 3; i++) {
         make_payload(p, order[i]);
-        mixer_jb_push(&jb, order[i], true, p, 30);
+        mixer_jb_push(&jb, order[i], true, p, MIXER_JB_LC3_BYTES);
     }
 
-    uint8_t out[30]; uint8_t len; bool vad;
+    uint8_t out[MIXER_JB_LC3_BYTES]; uint8_t len; bool vad;
     bool ok;
     ok = mixer_jb_pull(&jb, out, &len, &vad);
     CHECK(ok && payload_seq(out) == 1, "ooo pull -> 1");
@@ -103,12 +103,12 @@ static void test_jb_duplicate(void)
     mixer_jb_t jb;
     mixer_jb_init(&jb);
 
-    uint8_t p[30];
+    uint8_t p[MIXER_JB_LC3_BYTES];
     make_payload(p, 1);
-    mixer_jb_push(&jb, 1, true, p, 30);
-    mixer_jb_push(&jb, 1, true, p, 30);
+    mixer_jb_push(&jb, 1, true, p, MIXER_JB_LC3_BYTES);
+    mixer_jb_push(&jb, 1, true, p, MIXER_JB_LC3_BYTES);
 
-    uint8_t out[30]; uint8_t len; bool vad;
+    uint8_t out[MIXER_JB_LC3_BYTES]; uint8_t len; bool vad;
     bool ok;
     ok = mixer_jb_pull(&jb, out, &len, &vad);
     CHECK(ok && payload_seq(out) == 1, "dedup: first pull yields seq 1");
@@ -122,17 +122,17 @@ static void test_jb_stale(void)
     mixer_jb_t jb;
     mixer_jb_init(&jb);
 
-    uint8_t p[30];
+    uint8_t p[MIXER_JB_LC3_BYTES];
     make_payload(p, 5);
-    mixer_jb_push(&jb, 5, true, p, 30);
+    mixer_jb_push(&jb, 5, true, p, MIXER_JB_LC3_BYTES);
 
-    uint8_t out[30]; uint8_t len; bool vad;
+    uint8_t out[MIXER_JB_LC3_BYTES]; uint8_t len; bool vad;
     bool ok = mixer_jb_pull(&jb, out, &len, &vad);
     CHECK(ok && payload_seq(out) == 5, "pull seq 5");
 
     /* Push older seq=4 — should be rejected (stale). */
     make_payload(p, 4);
-    mixer_jb_push(&jb, 4, true, p, 30);
+    mixer_jb_push(&jb, 4, true, p, MIXER_JB_LC3_BYTES);
 
     ok = mixer_jb_pull(&jb, out, &len, &vad);
     CHECK(!ok, "stale seq 4 dropped");
@@ -147,13 +147,13 @@ static void test_jb_overflow(void)
     mixer_jb_t jb;
     mixer_jb_init(&jb);
 
-    uint8_t p[30];
+    uint8_t p[MIXER_JB_LC3_BYTES];
     for (uint16_t s = 1; s <= 5; s++) {
         make_payload(p, s);
-        mixer_jb_push(&jb, s, true, p, 30);
+        mixer_jb_push(&jb, s, true, p, MIXER_JB_LC3_BYTES);
     }
 
-    uint8_t out[30]; uint8_t len; bool vad;
+    uint8_t out[MIXER_JB_LC3_BYTES]; uint8_t len; bool vad;
     bool ok;
     ok = mixer_jb_pull(&jb, out, &len, &vad);
     CHECK(ok && payload_seq(out) == 3, "overflow keeps newest: pull 3");
@@ -171,23 +171,23 @@ static void test_jb_seq_wrap(void)
     mixer_jb_t jb;
     mixer_jb_init(&jb);
 
-    uint8_t p[30];
+    uint8_t p[MIXER_JB_LC3_BYTES];
     make_payload(p, 0xFFFE);
-    mixer_jb_push(&jb, 0xFFFE, true, p, 30);
+    mixer_jb_push(&jb, 0xFFFE, true, p, MIXER_JB_LC3_BYTES);
 
-    uint8_t out[30]; uint8_t len; bool vad;
+    uint8_t out[MIXER_JB_LC3_BYTES]; uint8_t len; bool vad;
     bool ok = mixer_jb_pull(&jb, out, &len, &vad);
     CHECK(ok && payload_seq(out) == 0xFFFE, "wrap: pull 0xFFFE");
 
     /* 0x0001 is newer than 0xFFFE under wrap-aware compare. */
     make_payload(p, 0x0001);
-    mixer_jb_push(&jb, 0x0001, true, p, 30);
+    mixer_jb_push(&jb, 0x0001, true, p, MIXER_JB_LC3_BYTES);
     ok = mixer_jb_pull(&jb, out, &len, &vad);
     CHECK(ok && payload_seq(out) == 0x0001, "wrap: 0x0001 accepted");
 
     /* 0xFFFD is older than 0x0001 under wrap-aware compare — stale. */
     make_payload(p, 0xFFFD);
-    mixer_jb_push(&jb, 0xFFFD, true, p, 30);
+    mixer_jb_push(&jb, 0xFFFD, true, p, MIXER_JB_LC3_BYTES);
     ok = mixer_jb_pull(&jb, out, &len, &vad);
     CHECK(!ok, "wrap: 0xFFFD rejected (stale across wrap)");
 }
@@ -198,13 +198,13 @@ static void test_jb_vad_passthrough(void)
     mixer_jb_t jb;
     mixer_jb_init(&jb);
 
-    uint8_t p[30];
+    uint8_t p[MIXER_JB_LC3_BYTES];
     make_payload(p, 10);
-    mixer_jb_push(&jb, 10, false, p, 30);
+    mixer_jb_push(&jb, 10, false, p, MIXER_JB_LC3_BYTES);
     make_payload(p, 11);
-    mixer_jb_push(&jb, 11, true,  p, 30);
+    mixer_jb_push(&jb, 11, true,  p, MIXER_JB_LC3_BYTES);
 
-    uint8_t out[30]; uint8_t len; bool vad;
+    uint8_t out[MIXER_JB_LC3_BYTES]; uint8_t len; bool vad;
     bool ok = mixer_jb_pull(&jb, out, &len, &vad);
     CHECK(ok && payload_seq(out) == 10 && vad == false, "vad=false preserved");
     ok = mixer_jb_pull(&jb, out, &len, &vad);

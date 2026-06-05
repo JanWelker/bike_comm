@@ -38,7 +38,7 @@
 #define MESH_MAX_RIDERS         8
 #define MESH_SUPERFRAME_US      20000
 #define MESH_SLOT_US            2500
-#define MESH_FRAME_PAYLOAD_BYTES 68    /* on-air bytes per slot */
+#define MESH_FRAME_PAYLOAD_BYTES 88    /* on-air bytes per slot */
 
 /* Flags bitfield in the on-air header. */
 #define MESH_FLAG_VAD_ACTIVE       (1u << 0)
@@ -77,7 +77,7 @@ esp_err_t mesh_mac_leave(void);
 
 /* Queue a frame for the next TX slot. Drops if the slot already has a
  * pending frame (we don't buffer audio — too late means too late). */
-esp_err_t mesh_mac_queue_tx(const uint8_t lc3_frame[30], bool vad_active);
+esp_err_t mesh_mac_queue_tx(const uint8_t lc3_frame[40], bool vad_active);
 
 void      mesh_mac_set_rx_cb(mesh_rx_cb_t cb);
 void      mesh_mac_set_event_cb(mesh_event_cb_t cb);

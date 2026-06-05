@@ -327,7 +327,7 @@ esp_err_t mesh_mac_leave(void)
 
 /* ---- TX queue ---- */
 
-esp_err_t mesh_mac_queue_tx(const uint8_t lc3_frame[30], bool vad_active)
+esp_err_t mesh_mac_queue_tx(const uint8_t lc3_frame[40], bool vad_active)
 {
     if (!lc3_frame) return ESP_ERR_INVALID_ARG;
     if (xSemaphoreTake(s_tx_mtx, 0) != pdTRUE) {
