@@ -55,9 +55,11 @@ typedef struct __attribute__((packed)) {
 _Static_assert(sizeof(mesh_frame_t) == MESH_PROTO_FRAME_BYTES,
                "mesh_frame_t must be 68 bytes on the wire");
 
-/* ---- beacon payload — lives in the bytes where lc3+lc3_prev normally
- * sit (offset 6 .. 65) when MESH_PROTO_FLAG_BEACON is set. The two LC3
- * slots are mutually exclusive with a beacon: beacons carry no audio. */
+/* ---- beacon payload — overlays the lc3_prev slot (offset 36 .. 65)
+ * when MESH_PROTO_FLAG_BEACON is set. The lc3 slot stays free for
+ * audio, letting the coordinator transmit one mic frame on every
+ * beacon-bearing slot 0 instead of going silent. LC3_PREV_VALID is
+ * always cleared on beacons (lc3_prev is beacon payload, not audio). */
 
 typedef struct __attribute__((packed)) {
     uint8_t  magic;                               /* MESH_PROTO_BEACON_MAGIC */
@@ -65,11 +67,11 @@ typedef struct __attribute__((packed)) {
     uint32_t us_timestamp;                        /* coord esp_timer mod 2^32 */
     uint8_t  slot_map;                            /* bit i = slot i claimed   */
     uint8_t  group_version;                       /* bumped on PSK/schema     */
-    uint8_t  reserved[49];                        /* zeros, future use        */
+    uint8_t  reserved[19];                        /* zeros, future use        */
 } mesh_beacon_t;
 
-_Static_assert(sizeof(mesh_beacon_t) == 2 * MESH_PROTO_LC3_BYTES,
-               "mesh_beacon_t must fit in lc3+lc3_prev space (60 B)");
+_Static_assert(sizeof(mesh_beacon_t) == MESH_PROTO_LC3_BYTES,
+               "mesh_beacon_t must fit in lc3_prev space (30 B)");
 
 /* ---- CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflect) ---- */
 

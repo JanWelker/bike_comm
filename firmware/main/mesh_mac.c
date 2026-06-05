@@ -143,14 +143,16 @@ static bool we_are_lowest_mac_in_group(void)
 
 static void fill_beacon_payload(mesh_frame_t *f)
 {
-    /* The beacon overlays the 60 B of lc3+fec. */
+    /* Beacon overlays the 30 B of lc3_prev only; lc3 stays available
+     * for audio so the coordinator can still ship one mic frame per
+     * beacon slot. */
     mesh_beacon_t b = (mesh_beacon_t){0};
     b.magic         = MESH_PROTO_BEACON_MAGIC;
     b.coord_mac_low = s_our_mac_low;
     b.us_timestamp  = (uint32_t)esp_timer_get_time();
     b.slot_map      = s_slot_map;
     b.group_version = s_group_version;
-    memcpy(&f->lc3[0], &b, sizeof(b));
+    memcpy(&f->lc3_prev[0], &b, sizeof(b));
 }
 
 /* ---- init / start / stop ---- */
@@ -400,19 +402,31 @@ static void mesh_tx_task(void *arg)
 
         bool send_this_slot = false;
 
+        /* Coordinator role: alternate slot-0 between beacon (even
+         * superframes) and audio (odd superframes). The 30 B beacon
+         * lives in lc3_prev only, so beacon slots can still ship one
+         * audio frame in lc3 — bumps coord -> joiner from 50 fps to
+         * 75 fps. Full 100 fps closure needs a dedicated 9th beacon
+         * slot. */
+        bool will_beacon = (s_own_slot == 0 && we_hold_coordinator_role() &&
+                            (s_superframe_counter & 1u) == 0);
+
         xSemaphoreTake(s_tx_mtx, portMAX_DELAY);
         if (s_pending_join)  { f.flags |= MESH_PROTO_FLAG_JOIN;  s_pending_join = false; }
         if (s_pending_leave) { f.flags |= MESH_PROTO_FLAG_LEAVE; s_pending_leave = false; }
         if (s_tx_ring_count > 0) {
-            /* Bundle the two oldest unsent. f.seq names the newer of
-             * the two (or the only one); lc3_prev's implicit seq is
-             * f.seq-1. s_tx_seq stays 1:1 with LC3 frames. */
+            /* On audio slots, bundle the two oldest unsent into
+             * lc3 + lc3_prev. On beacon slots, only pull one (the
+             * newer goes into lc3; lc3_prev will be overlaid with the
+             * beacon below). f.seq names the newer frame; lc3_prev's
+             * implicit seq is f.seq - 1. s_tx_seq stays 1:1 with LC3
+             * frames. */
             uint8_t oldest = (uint8_t)((s_tx_ring_head
                                         + MESH_TX_RING_SLOTS
                                         - s_tx_ring_count)
                                        % MESH_TX_RING_SLOTS);
             bool vad_union = s_tx_ring[oldest].vad;
-            if (s_tx_ring_count >= 2) {
+            if (!will_beacon && s_tx_ring_count >= 2) {
                 uint8_t newer = (uint8_t)((oldest + 1) % MESH_TX_RING_SLOTS);
                 memcpy(f.lc3_prev, s_tx_ring[oldest].lc3, LC3_FRAME_BYTES);
                 memcpy(f.lc3,      s_tx_ring[newer].lc3,  LC3_FRAME_BYTES);
@@ -438,22 +452,11 @@ static void mesh_tx_task(void *arg)
         }
         xSemaphoreGive(s_tx_mtx);
 
-        /* Coordinator role: alternate slot-0 between beacon (even
-         * superframes) and audio (odd superframes). Original spec
-         * had beacon every superframe, which trashes the coordinator's
-         * own audio TX; halving the beacon rate to 25 fps gives peers
-         * 40 ms between beacons (still well below the 100 ms
-         * coordinator-lost threshold) and lets the coordinator emit
-         * actual audio on the off-frames. */
-        if (s_own_slot == 0 && we_hold_coordinator_role() &&
-            (s_superframe_counter & 1u) == 0) {
-            /* Beacon overlays both lc3 + lc3_prev slots, so any audio
-             * the audio_io task queued for this slot is dropped on
-             * the floor (one of the known asymmetries — see
-             * docs/mesh_protocol.md). Clear the LC3_PREV_VALID flag
-             * because the lc3_prev bytes are beacon payload here. */
-            f.flags &= ~MESH_PROTO_FLAG_LC3_PREV_VALID;
-            f.flags |= MESH_PROTO_FLAG_BEACON | MESH_PROTO_FLAG_VAD_ACTIVE;
+        if (will_beacon) {
+            /* Beacon overlays lc3_prev only; lc3 keeps whatever audio
+             * the ring drained into it. LC3_PREV_VALID stays cleared
+             * because lc3_prev is beacon payload here, not audio. */
+            f.flags |= MESH_PROTO_FLAG_BEACON;
             fill_beacon_payload(&f);
             send_this_slot = true;
         }
@@ -585,10 +588,12 @@ static void on_esp_now_recv(const esp_now_recv_info_t *info,
         s_peer_mac_low[rid] = mac_low_from_bytes(info->src_addr);
     }
 
-    /* Beacon handling. */
+    /* Beacon handling. The 30 B beacon lives in lc3_prev; lc3 still
+     * carries one audio frame (LC3_PREV_VALID is always cleared on
+     * beacons). Fall through to audio delivery below. */
     if (f->flags & MESH_PROTO_FLAG_BEACON) {
         mesh_beacon_t b;
-        memcpy(&b, &f->lc3[0], sizeof(b));
+        memcpy(&b, &f->lc3_prev[0], sizeof(b));
         if (b.magic == MESH_PROTO_BEACON_MAGIC) {
             s_slot_map      = b.slot_map;
             s_group_version = b.group_version;
@@ -597,8 +602,6 @@ static void on_esp_now_recv(const esp_now_recv_info_t *info,
             /* TODO(v0.5): phase-lock our local superframe clock to
              * b.us_timestamp here. */
         }
-        /* Beacon carries no audio. */
-        return;
     }
 
     /* JOIN flag: another rider claimed a slot. */

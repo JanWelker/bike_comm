@@ -54,19 +54,21 @@ The CRC is a defense against firmware bugs, not adversaries — see the Security
 
 ## Beacon
 
-When `flags & BEACON`, the bytes that would be `lc3` + `lc3_prev` instead carry:
+When `flags & BEACON`, the `lc3_prev` slot (offset 36..65) instead carries:
 
 ```
 offset  size  field
-   6     1    BEACON_MAGIC    (0xB1)
-   7     4    coord_mac_low   (lowest 4 bytes of coordinator MAC)
-  11     4    us_timestamp    (esp_timer_get_time() at TX start, modulo 2^32)
-  15     1    slot_map        (bit i = 1 if slot i is claimed)
-  16     1    group_version   (bumped on PSK change, schema change, etc.)
-  17    49    reserved (zeros, for future fields)
+  36     1    BEACON_MAGIC    (0xB1)
+  37     4    coord_mac_low   (lowest 4 bytes of coordinator MAC)
+  41     4    us_timestamp    (esp_timer_get_time() at TX start, modulo 2^32)
+  45     1    slot_map        (bit i = 1 if slot i is claimed)
+  46     1    group_version   (bumped on PSK change, schema change, etc.)
+  47    19    reserved (zeros, for future fields)
 ```
 
-The coordinator emits a beacon by setting BEACON + VAD flags on a slot-0 frame; the `lc3` + `lc3_prev` bytes are overwritten by the beacon payload above (so `LC3_PREV_VALID` is cleared on beacon frames). To let the coordinator still transmit its own audio, slot 0 **alternates** between beacon (even superframes) and audio (odd superframes), halving the beacon rate to 25 fps (one beacon every 40 ms). The coordinator-loss timer (10 superframes ≈ 200 ms) tolerates the wider gap.
+`LC3_PREV_VALID` is always cleared on beacon frames (those 30 B are beacon, not audio). The `lc3` slot still carries one audio frame, so the coordinator transmits one mic frame on every beacon-bearing slot 0 instead of going silent.
+
+Slot 0 alternates between beacon (even superframes) and audio (odd superframes). Beacon rate is 25 fps (one beacon every 40 ms); the coordinator-loss timer (10 superframes ≈ 200 ms) tolerates the wider gap. Coordinator audio rate is 75 fps (25 beacon-slot frames + 50 audio-slot frames per second) — see the asymmetry note below.
 
 ## Join
 
@@ -117,12 +119,13 @@ from a single packet loss; carrying F_{n-1} directly is strictly
 better at the same 30 B cost.
 
 Asymmetry note: the coordinator's slot 0 alternates beacon and audio
-(see "Beacon"), so the 20 ms of mic audio captured during a beacon
-slot is overwritten by beacon payload before TX. Net coordinator
-audio rate is ~50 fps over the wire (every other slot, two frames
-per slot) vs ~100 fps for joiners. Closing this fully needs a
-dedicated 9th beacon slot or a 4-frame bundle on coordinator audio
-slots — v0.5 work.
+(see "Beacon"). Audio slots carry 2 frames; beacon slots carry 1
+(the other 30 B is beacon payload). Net coordinator audio rate is
+~75 fps over the wire vs ~100 fps for joiners — the missing 25 fps
+is the one mic frame per beacon slot that doesn't fit. The TX ring
+evicts oldest under that sustained back-pressure, so the lost frame
+is distributed evenly. Closing the gap fully needs a dedicated 9th
+beacon slot — v0.5 work.
 
 ## No retransmission
 
@@ -140,6 +143,6 @@ Voice frames are loss-tolerant; late frames are useless. Retransmission would bl
 
 ## Open issues (revisit during build)
 
-1. **Beacon piggyback eating slot 0 audio** — at v0 this halves the coordinator's audio TX rate vs joiners (50 fps vs 100 fps). Two ways to close: promote beacon to a dedicated 9th slot (shrinks each audio slot to ~2.22 ms — math still works), or bundle 4 LC3 frames per packet on coordinator audio slots (wider on-air frame, still within MTU). Pick when the asymmetry becomes audibly meaningful.
+1. **Beacon piggyback eating slot 0 audio** — the 30 B beacon fits in lc3_prev, so beacon slots still carry one audio frame in lc3, bringing the coordinator to 75 fps (vs joiners' 100 fps). The remaining 25 fps gap needs either a dedicated 9th beacon slot (shrinks each audio slot to ~2.22 ms — math still works) or a 4-LC3-frame bundle on coordinator audio slots (wider on-air frame, still within MTU). Pick when the asymmetry becomes audibly meaningful.
 2. **Collision detection during JOIN** — we infer collision from "next beacon didn't add our bit." A more robust scheme listens to other riders' RSSI of our own JOIN — TBD on bench.
 3. **Multi-hop** — explicitly deferred to v2.
