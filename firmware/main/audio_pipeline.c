@@ -539,6 +539,14 @@ static void loopback_task(void *arg)
             }
         }
 #endif
+        /* LC3 wall-clock perf log every 1000 frames (~10 s). Numbers
+         * land in docs/codec_perf.md. */
+        {
+            static uint32_t s_perf_n = 0;
+            if ((++s_perf_n % 1000) == 0) {
+                codec_lc3_perf_log_and_reset();
+            }
+        }
         int rc_w = esp_codec_dev_write(s_spk_dev, spk_buf, LOOPBACK_FRAME_BYTES);
         if (rc_w != ESP_CODEC_DEV_OK) {
             if ((++underruns % 100) == 1) {

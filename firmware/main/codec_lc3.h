@@ -37,3 +37,9 @@ void      codec_lc3_decoder_release(uint8_t rider_id);
 size_t    codec_lc3_decode(uint8_t rider_id,
                            const uint8_t *bytes, size_t len,
                            int16_t out_pcm[160]);
+
+/* Log accumulated encode/decode wall-clock stats (mean / max in us) and
+ * reset the counters. Intended to be called periodically (e.g. once
+ * per 10 s) from the audio_io task. Pure diagnostic — costs nothing
+ * when nobody calls it. See docs/codec_perf.md for the captured numbers. */
+void      codec_lc3_perf_log_and_reset(void);

@@ -51,6 +51,7 @@ mesh_proto layout-size assertion has caught silent rot before.
 | `docs/architecture.md` | Block diagram, layer map, CPU budget |
 | `docs/mesh_protocol.md` | Wire format, slot math, beacon, failover |
 | `docs/build_v0.md` | Bench bring-up, gotchas, definition-of-done |
+| `docs/codec_perf.md` | Measured LC3 encode/decode cost on LX6 (LyraT-Mini bench) — the only LX6 codec numbers we have, since esp_audio_codec only publishes S3R8 |
 | `tools/psk_gen.py` | Generate the 16 B group PSK |
 
 ## Hardware quirks worth knowing up front
@@ -94,14 +95,27 @@ mesh_proto layout-size assertion has caught silent rot before.
   2.4.6's precompiled `ns_process` for ESP32 calls
   `heap_caps_check_integrity_all` and crashes walking our heap; older
   2.0.5 doesn't have the check but exhausts internal DRAM and OOMs
-  the audio task. Path forward is either ESP32-S3 (where esp-sr is
-  the supported target and has PIE) or vendoring a clean WebRTC NS
-  source tree.
+  the audio task. The vendoring path forward (verified 2026-06) is
+  `cpuimage/WebRTC_NS` — BSD-3, single-TU float32 C, int16 PCM API,
+  10 ms / 160-sample blocks that map 1:1 to our LC3 cadence. ~20-25
+  KB RAM per instance, float-FFT cost on LX6 (no PIE) needs measure-
+  ment against the audio_io DRAM budget before integration.
 - **The app partition is ~99% full.** Each OTA slot is 0x1C0000
   (1.75 MB) and the current binary fills nearly all of it — adding
   any managed component over ~30 KB will overflow. There's a 380 KB
   unused `storage` spiffs partition at the end of flash that can be
   shrunk to give the OTA slots more room.
+- **Wi-Fi must stay in `WIFI_MODE_STA` once BT Classic is on.**
+  Espressif's coexist.html marks ESP-NOW RX as `S` (stable in STA
+  mode only) under all BR/EDR coexistence states; APSTA/AP modes
+  will degrade ESP-NOW RX (audio + beacons). `main.c::platform_init`
+  already sets STA and asserts it — don't relax that without
+  revisiting the whole coex story.
+- **esp_audio_codec performance tables are S3R8-only.** Espressif's
+  benchmarks (LC3, Opus, AAC, etc.) are measured on ESP32-S3R8 with
+  LX7 + PIE vector ops. Numbers cannot be transferred 1:1 to our
+  LX6. For LX6 planning, use the measurements in `docs/codec_perf.md`
+  (our own LyraT-Mini bench) or re-measure.
 
 ## Code conventions
 
@@ -149,6 +163,43 @@ mesh_proto layout-size assertion has caught silent rot before.
 - When tweaking timing constants (slot length, beacon cadence,
   coord-loss threshold), update both the code and
   `docs/mesh_protocol.md` in the same commit.
+
+## Open work (v0.5 roadmap)
+
+Concrete updates surfaced by the 2026-06 deep-research pass over the
+OSS landscape. Listed in priority order; tick the box when landed.
+Each item names the source / proven OSS work to draw from. The full
+research notes live in the workflow output under the session tasks
+dir.
+
+- [x] **Lock `WIFI_MODE_STA` at boot.** Done; assertion in
+  `platform_init`. See gotcha above.
+- [x] **Measure LC3 cost on LX6.** Done; see `docs/codec_perf.md`.
+- [ ] **Vendor `cpuimage/WebRTC_NS` as the NS module.** Replaces the
+  dead esp-sr path. 1-2 days integration + 1 day profiling. Watch
+  DRAM (~20-25 KB per instance) and float-FFT CPU on LX6.
+- [ ] **Adopt `Hemisphere-Project/ESPNowMeshClock`'s forward-only-
+  slewed time-sync algorithm** for beacon resync. GPL-3.0 — license
+  review before vendoring; reimplementing the algorithm is also
+  viable. 0.5-1 day.
+- [ ] **Add Codec2 as a build-time alternate codec behind Kconfig.**
+  Source: `M17-Project/codec2` + `onemikedelta/M17-ESP32` (LX6 proof
+  via `sh123/esp32_loradv`). 8 B/20 ms frames are 5x smaller than
+  our 40 B LC3 — gives loss-tolerance margin and a 6-8-rider
+  fallback. **Needs partition resize first** (99% full). 2-3 days
+  + 1 day A/B speech eval.
+- [ ] **Vendor SpeexDSP** (from `rjsachse/ESP32-SpeexDSP/src/speex/`)
+  for AEC + AGC + VAD — pull the C sources, not the Arduino wrapper.
+  Matters once helmet speaker bleeds into mic. 3-5 days; DRAM audit
+  first.
+- [ ] **Bookmark `tanakamasayuki/PCMFlowG722`** as a Plan-B wideband
+  codec (~10 KB flash, ~512 B RAM, but 64 kbps wire cost is 2x our
+  LC3 — bad for the 8-slot frame). 0 effort; don't migrate.
+- [ ] **Defer BTstack-vs-Bluedroid decision** until coexistence is
+  bench-tested with HFP on STA-locked Wi-Fi + mesh active. No
+  verified OSS evidence currently favors either stack on LX6 in
+  2026; decision must be data-driven. 1 week bench harness when
+  ready.
 
 ## Auto-memory
 

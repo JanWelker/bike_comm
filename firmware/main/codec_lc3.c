@@ -18,9 +18,21 @@
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "lc3.h"
 
 static const char *TAG = "lc3";
+
+/* Wall-clock perf counters around each lc3_encode / lc3_decode call.
+ * Reset on every codec_lc3_perf_log_and_reset() call. esp_audio_codec
+ * only publishes S3R8 (LX7+PIE) numbers — these counters give us
+ * actual LX6 figures from the LyraT-Mini bench. See docs/codec_perf.md. */
+static int64_t  s_enc_us_sum = 0;
+static int64_t  s_enc_us_max = 0;
+static uint32_t s_enc_count  = 0;
+static int64_t  s_dec_us_sum = 0;
+static int64_t  s_dec_us_max = 0;
+static uint32_t s_dec_count  = 0;
 
 typedef struct {
     bool           in_use;
@@ -95,8 +107,13 @@ size_t codec_lc3_encode(const int16_t pcm[LC3_PCM_SAMPLES],
     if (s_encoder == NULL || pcm == NULL || out == NULL) {
         return 0;
     }
+    int64_t t0 = esp_timer_get_time();
     int rc = lc3_encode(s_encoder, LC3_PCM_FORMAT_S16,
                         pcm, 1 /* stride */, LC3_FRAME_BYTES, out);
+    int64_t dt = esp_timer_get_time() - t0;
+    s_enc_us_sum += dt;
+    if (dt > s_enc_us_max) s_enc_us_max = dt;
+    s_enc_count++;
     if (rc != 0) {
         ESP_LOGW(TAG, "lc3_encode rc=%d", rc);
         return 0;
@@ -156,12 +173,35 @@ size_t codec_lc3_decode(uint8_t rider_id,
 
     /* Per liblc3: in=NULL triggers PLC; lc3_decode returns
      * 0 on success, 1 if PLC was operated, -1 on bad params. */
+    int64_t t0 = esp_timer_get_time();
     int rc = lc3_decode(s_decoders[rider_id].dec,
                         bytes, (int)len,
                         LC3_PCM_FORMAT_S16, out_pcm, 1 /* stride */);
+    int64_t dt = esp_timer_get_time() - t0;
+    s_dec_us_sum += dt;
+    if (dt > s_dec_us_max) s_dec_us_max = dt;
+    s_dec_count++;
     if (rc < 0) {
         ESP_LOGW(TAG, "lc3_decode rider=%u rc=%d", rider_id, rc);
         return 0;
     }
     return LC3_PCM_SAMPLES;
+}
+
+void codec_lc3_perf_log_and_reset(void)
+{
+    if (s_enc_count > 0) {
+        ESP_LOGI(TAG, "enc: n=%u mean=%lld us max=%lld us",
+                 (unsigned)s_enc_count,
+                 (long long)(s_enc_us_sum / (int64_t)s_enc_count),
+                 (long long)s_enc_us_max);
+    }
+    if (s_dec_count > 0) {
+        ESP_LOGI(TAG, "dec: n=%u mean=%lld us max=%lld us",
+                 (unsigned)s_dec_count,
+                 (long long)(s_dec_us_sum / (int64_t)s_dec_count),
+                 (long long)s_dec_us_max);
+    }
+    s_enc_us_sum = 0; s_enc_us_max = 0; s_enc_count = 0;
+    s_dec_us_sum = 0; s_dec_us_max = 0; s_dec_count = 0;
 }

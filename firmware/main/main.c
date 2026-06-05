@@ -122,8 +122,22 @@ static void platform_init(void)
     wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    /* STA mode is non-negotiable: Espressif's coexist.html marks
+     * ESP-NOW RX as "S" (stable in STA mode only) under every BR/EDR
+     * coexistence state. APSTA/AP will degrade ESP-NOW RX (audio +
+     * beacons) once BT Classic is enabled. Asserted below so a future
+     * change can't silently swap us into a broken mode. */
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    wifi_mode_t actual_mode = WIFI_MODE_NULL;
+    ESP_ERROR_CHECK(esp_wifi_get_mode(&actual_mode));
+    if (actual_mode != WIFI_MODE_STA) {
+        ESP_LOGE(TAG, "wifi mode is %d, not WIFI_MODE_STA (%d) — "
+                      "ESP-NOW RX is undefined when BT Classic is on",
+                 actual_mode, WIFI_MODE_STA);
+        abort();
+    }
 
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));

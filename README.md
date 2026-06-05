@@ -38,7 +38,10 @@ See [`docs/architecture.md`](docs/architecture.md) for the design,
   / 32 kbps.
 - Custom TDMA MAC over ESP-NOW for the mesh (20 ms superframe, 8 slots).
 - Bluedroid for BT Classic HFP-HF + A2DP-sink (planned, not yet wired).
-- ESP-SR AFE for AEC + NS + VAD (planned, not yet wired).
+- Noise suppression via vendored `cpuimage/WebRTC_NS` (planned) — the
+  precompiled `espressif/esp-sr` AFE shipped for the original ESP32 has
+  a runtime heap-check that crashes on this chip, so we're taking the
+  WebRTC source-tree route instead.
 
 ## Quick start
 
@@ -64,10 +67,41 @@ tools/       helper scripts (PSK gen, future log parser, future flash)
 
 ## Roadmap
 
-- **v0**  — 2 dev boards talking voice over ESP-NOW (no phone). 2 weeks.
-- **v0.5** — 4-rider mesh + phone HFP/A2DP. +3 weeks.
-- **v1**  — Custom PCB. +6 weeks.
-- **v2**  — Field beta + helmet enclosure. +8 weeks.
+- **v0**  — 2 dev boards talking voice over ESP-NOW (no phone). Done.
+- **v0.5** — 4-8 rider mesh + phone HFP/A2DP + noise suppression. The
+  concrete backlog (NS via WebRTC_NS, mesh time-sync via the
+  forward-only-slew algorithm from ESPNowMeshClock, optional Codec2
+  alt codec, BTstack-vs-Bluedroid bench eval) lives in `CLAUDE.md`
+  under "Open work."
+- **v1**  — Custom PCB on ESP32-S3 (PIE vector ops let us run the
+  full ESP-SR AFE pipeline that can't fit on the LX6).
+- **v2**  — Field beta + helmet enclosure.
+
+## Related open-source work
+
+bike_comm draws on, and complements, the existing ESP32-voice
+ecosystem. None of these are direct substitutes — they tend to be
+half-duplex PTT or star topologies, not continuous full-duplex
+TDMA mesh — but they're the closest prior art and worth a look:
+
+- [google/liblc3](https://github.com/google/liblc3) — the voice
+  codec we use, vendored at v1.1.1.
+- [atomic14/esp32-walkie-talkie](https://github.com/atomic14/esp32-walkie-talkie)
+  — selectable UDP / ESP-NOW transport, half-duplex PTT.
+- [sh123/esp32_loradv](https://github.com/sh123/esp32_loradv)
+  — runtime-selectable Codec2 / Opus on plain WROOM32 LX6; proves
+  both codecs fit on our MCU class.
+- [M17 protocol](https://m17project.org/about/) +
+  [onemikedelta/M17-ESP32](https://github.com/onemikedelta/M17-ESP32)
+  — Codec2-based open digital radio, frame layout we'd borrow if
+  we add Codec2 as an alternate codec.
+- [tanakamasayuki/PCMFlowG722](https://github.com/tanakamasayuki/PCMFlowG722)
+  — G.722 over ESP-NOW; useful as a small/cheap wideband fallback
+  if LC3 ever pinches.
+- [cpuimage/WebRTC_NS](https://github.com/cpuimage/WebRTC_NS) and
+  [rjsachse/ESP32-SpeexDSP](https://github.com/rjsachse/ESP32-SpeexDSP)
+  — the two known-good vendorable DSP trees (NS, AEC, AGC, VAD)
+  for the LX6 since `espressif/esp-sr` doesn't work here.
 
 ## License
 
