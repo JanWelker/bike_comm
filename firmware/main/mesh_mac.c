@@ -11,6 +11,7 @@
 #include "mesh_proto.h"
 #include "codec_lc3.h"   /* for LC3_FRAME_BYTES */
 
+#include <inttypes.h>
 #include <string.h>
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -32,6 +33,24 @@ static const char *TAG = "mesh";
                                              beacon loss now that the coordinator
                                              only beacons every other superframe */
 #define MESH_PEER_QUIET_SFRAMES 10        /* §implicit leave        */
+
+/* Forward-only-slewed mesh time sync. The coordinator's local esp_timer
+ * IS the mesh clock; joiners maintain s_mesh_clock_offset_us so
+ * mesh_now_us() returns the coord's notion of "now." On each beacon RX
+ * the joiner computes delta = coord_timestamp - mesh_now_us() and
+ * applies it:
+ *   - first beacon ever:                       snap to align.
+ *   - subsequent, delta > MESH_CLOCK_LARGE_STEP: snap forward (coord
+ *       changed, packet loss accumulated drift).
+ *   - subsequent, 0 < delta <= LARGE_STEP:     slew by delta/SLEW_DEN.
+ *   - delta <= 0 (we're ahead of coord):       ignore — forward-only.
+ *
+ * Forward-only protects joiners from running their slot scheduler
+ * backwards through coord failover. Algorithm cribbed from
+ * Hemisphere-Project/ESPNowMeshClock (GPL-3.0; algorithm only, no
+ * code copied). */
+#define MESH_CLOCK_SLEW_DEN        16     /* alpha = 1/16: ~640 ms half-life */
+#define MESH_CLOCK_LARGE_STEP_US   5000   /* >5 ms = jump, not slew  */
 
 static const uint8_t BROADCAST_MAC[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
@@ -57,6 +76,10 @@ static uint16_t s_peer_quiet_sframes[MESH_MAX_RIDERS];
 
 /* coordinator tracking */
 static uint16_t s_sframes_since_beacon = 0xFFFF;   /* large → "never heard" */
+
+/* Mesh time sync — see MESH_CLOCK_* block above. */
+static int64_t s_mesh_clock_offset_us = 0;
+static bool    s_mesh_clock_locked    = false;
 
 /* mesh state machine */
 typedef enum {
@@ -114,6 +137,14 @@ static uint32_t mac_low_from_bytes(const uint8_t mac[6])
            ((uint32_t)mac[5]);
 }
 
+/* Mesh-time "now" — local esp_timer plus the slewed coord offset.
+ * Coordinator's offset stays 0, so mesh_now_us() == esp_timer_get_time()
+ * on the coord side. Joiners' offset is set/slewed on each beacon RX. */
+static int64_t mesh_now_us(void)
+{
+    return esp_timer_get_time() + s_mesh_clock_offset_us;
+}
+
 /* "Should I beacon right now?" — true iff we currently hold the role per
  * s_coord_mac_low, which is only ever assigned from (1) our own bootstrap,
  * (2) a failover takeover, or (3) a received beacon. JOIN frames do NOT
@@ -145,11 +176,14 @@ static void fill_beacon_payload(mesh_frame_t *f)
 {
     /* Beacon overlays the 30 B of lc3_prev only; lc3 stays available
      * for audio so the coordinator can still ship one mic frame per
-     * beacon slot. */
+     * beacon slot. Timestamp is in mesh time (== local esp_timer on a
+     * fresh coord, == slewed offset on a coord that took over from
+     * the previous one) so joiners' slew stays continuous through
+     * failover. */
     mesh_beacon_t b = (mesh_beacon_t){0};
     b.magic         = MESH_PROTO_BEACON_MAGIC;
     b.coord_mac_low = s_our_mac_low;
-    b.us_timestamp  = (uint32_t)esp_timer_get_time();
+    b.us_timestamp  = (uint32_t)mesh_now_us();
     b.slot_map      = s_slot_map;
     b.group_version = s_group_version;
     memcpy(&f->lc3_prev[0], &b, sizeof(b));
@@ -354,26 +388,24 @@ void mesh_mac_set_event_cb(mesh_event_cb_t cb) { s_event_cb = cb; }
 
 /* ---- TX task: superframe scheduler ----------------------------------
  *
- * v0 timing model: a single esp_timer-driven loop that wakes once per
- * superframe, sleeps until our slot, transmits, then sleeps to the next
- * superframe boundary. Drift is bounded by FreeRTOS tick granularity
- * (typically 1 ms) — fine for 1.5 ms guard window on a single hop.
- *
- * TODO(v0.5): replace with a beacon-PLL'd hi-res esp_timer. The
- * coordinator's `us_timestamp` field in the beacon is the master clock;
- * every other node should phase-lock its slot scheduler to it. v0 just
- * uses local esp_timer.
+ * v0 timing model: a single mesh_now_us()-driven loop that wakes once
+ * per superframe, sleeps until our slot, transmits, then sleeps to the
+ * next superframe boundary. Joiners get their mesh_now_us() slewed
+ * forward by the beacon RX path (see MESH_CLOCK_* above), so all slot
+ * timings are in coord-relative mesh time. Sleeps use local esp_timer
+ * under the hood — the difference between two mesh-time values IS the
+ * duration we want to sleep regardless.
  */
 static void mesh_tx_task(void *arg)
 {
     (void)arg;
-    int64_t  superframe_start = esp_timer_get_time();
+    int64_t  superframe_start = mesh_now_us();
 
     while (!s_task_should_exit) {
         /* If we're not in the group, just wait a superframe. */
         if (s_state != MESH_S_JOINED && s_state != MESH_S_JOINING_CLAIM) {
             vTaskDelay(pdMS_TO_TICKS(20));
-            superframe_start = esp_timer_get_time();
+            superframe_start = mesh_now_us();
             s_superframe_counter++;
             continue;
         }
@@ -381,7 +413,7 @@ static void mesh_tx_task(void *arg)
         /* Sleep until just before our slot start. */
         int64_t slot_start_us = superframe_start +
                                 (int64_t)s_own_slot * MESH_SLOT_US;
-        int64_t now           = esp_timer_get_time();
+        int64_t now           = mesh_now_us();
         int64_t to_sleep_us   = slot_start_us - now;
         if (to_sleep_us > 1000) {
             vTaskDelay(pdMS_TO_TICKS((to_sleep_us - 500) / 1000));
@@ -389,7 +421,7 @@ static void mesh_tx_task(void *arg)
         /* Burn the last few hundred µs in busy-wait to align tighter
          * than the FreeRTOS tick. TODO(v0.5): use the high-res timer
          * with an ISR-driven semaphore release instead. */
-        now = esp_timer_get_time();
+        now = mesh_now_us();
         if (now < slot_start_us) {
             esp_rom_delay_us((uint32_t)(slot_start_us - now));
         }
@@ -489,11 +521,11 @@ static void mesh_tx_task(void *arg)
 
         /* Sleep to the end of this superframe, then advance. */
         int64_t next_superframe = superframe_start + MESH_SUPERFRAME_US;
-        now = esp_timer_get_time();
+        now = mesh_now_us();
         if (next_superframe > now) {
             int64_t rem = next_superframe - now;
             if (rem > 1000) vTaskDelay(pdMS_TO_TICKS((rem - 500) / 1000));
-            now = esp_timer_get_time();
+            now = mesh_now_us();
             if (now < next_superframe) {
                 esp_rom_delay_us((uint32_t)(next_superframe - now));
             }
@@ -599,8 +631,31 @@ static void on_esp_now_recv(const esp_now_recv_info_t *info,
             s_group_version = b.group_version;
             s_coord_mac_low = b.coord_mac_low;
             s_sframes_since_beacon = 0;
-            /* TODO(v0.5): phase-lock our local superframe clock to
-             * b.us_timestamp here. */
+
+            /* Forward-only-slew our mesh clock toward the coord's.
+             * Skip if we ARE the coord (offset stays 0 by definition).
+             * The wire timestamp is the bottom 32 bits of coord's
+             * esp_timer at TX; difference vs our current mesh-time
+             * (mod 2^32) is taken as a signed int32 so the diff wraps
+             * cleanly. Transit time is treated as negligible — the
+             * slew absorbs sub-ms error within tens of beacons. */
+            if (s_coord_mac_low != s_our_mac_low) {
+                uint32_t our_now_mod = (uint32_t)mesh_now_us();
+                int32_t  delta_us    = (int32_t)(b.us_timestamp - our_now_mod);
+                if (!s_mesh_clock_locked) {
+                    s_mesh_clock_offset_us += delta_us;
+                    s_mesh_clock_locked = true;
+                    ESP_LOGI(TAG, "mesh clock locked, initial offset %" PRId32 " us",
+                             delta_us);
+                } else if (delta_us > MESH_CLOCK_LARGE_STEP_US) {
+                    s_mesh_clock_offset_us += delta_us;
+                    ESP_LOGI(TAG, "mesh clock snap forward %" PRId32 " us",
+                             delta_us);
+                } else if (delta_us > 0) {
+                    s_mesh_clock_offset_us += delta_us / MESH_CLOCK_SLEW_DEN;
+                }
+                /* delta_us <= 0: we're ahead of coord — ignore. */
+            }
         }
     }
 

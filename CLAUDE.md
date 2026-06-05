@@ -183,10 +183,25 @@ dir.
   bumped 1.75 → 1.875 MB) to fit. With NS landed the audio_io tick
   sits at ~7.4 ms of 10 ms at 2 riders — further DSP additions will
   need to live on the other core. See `docs/codec_perf.md`.
-- [ ] **Adopt `Hemisphere-Project/ESPNowMeshClock`'s forward-only-
-  slewed time-sync algorithm** for beacon resync. GPL-3.0 — license
-  review before vendoring; reimplementing the algorithm is also
-  viable. 0.5-1 day.
+- [x] **Adopt `Hemisphere-Project/ESPNowMeshClock`'s forward-only-
+  slewed time-sync algorithm** for beacon resync. Done; reimplemented
+  in `mesh_mac.c` (`mesh_now_us`, `MESH_CLOCK_*` constants) — no
+  GPL-3.0 code copied, only the algorithm. Slew alpha = 1/16, large-
+  step threshold = 5 ms. First beacon snaps the joiner's clock to the
+  coord's; subsequent ones slew silently. Verified: rx-drain rates
+  stay at ~100/75 fps after lock.
+- [ ] **VAD-gate the TX path so we don't transmit silence.** Today
+  `audio_pipeline.c` hard-codes `vad_active=true` in every
+  `mesh_mac_queue_tx` call, so we burn airtime + power broadcasting
+  noise floor 100 fps even when nobody's speaking. The receiver
+  already honours the VAD bit on the wire (since commit `e0e1ac8`)
+  and the mixer skips decode on VAD-inactive frames; we just need a
+  real source for the bit. Options: (a) ride along on
+  `cpuimage/WebRTC_NS`'s internal voice-probability — `WebRtcNs_
+  prior_speech_probability` is already exposed by our vendored copy
+  and costs zero extra CPU; (b) energy-threshold heuristic from the
+  current mic_level diagnostic; (c) wait for SpeexDSP vendoring to
+  bring proper webrtc-vad. (a) is the cheap right answer. 0.5 day.
 - [ ] **Add Codec2 as a build-time alternate codec behind Kconfig.**
   Source: `M17-Project/codec2` + `onemikedelta/M17-ESP32` (LX6 proof
   via `sh123/esp32_loradv`). 8 B/20 ms frames are 5x smaller than
