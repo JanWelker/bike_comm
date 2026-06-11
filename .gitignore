@@ -27,3 +27,9 @@ venv/
 .vscode/
 .idea/
 *.swp
+
+# graphify (knowledge-graph build output)
+graphify-out/
+
+# Claude Code project-local config and skill installs
+.claude/
