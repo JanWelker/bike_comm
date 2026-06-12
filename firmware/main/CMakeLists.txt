@@ -3,18 +3,19 @@
 # unselected file would produce duplicate-symbol link errors so we
 # include only the chosen one.
 if(CONFIG_BIKE_CODEC_CODEC2)
-    set(CODEC_SRC "codec_codec2.c")
+    set(CODEC_SRCS "codec_codec2.c" "resampler_16_8.c")
 else()
-    set(CODEC_SRC "codec_lc3.c")
+    set(CODEC_SRCS "codec_lc3.c")
 endif()
 
 idf_component_register(
     SRCS
         "main.c"
         "audio_pipeline.c"
-        "${CODEC_SRC}"
+        ${CODEC_SRCS}
         "mesh_mac.c"
         "mesh_proto.c"
+        "mesh_crypto.c"
         "mixer.c"
         "mixer_jb.c"
         "bt_classic.c"
@@ -36,6 +37,8 @@ idf_component_register(
         esp_event
         esp_timer
         liblc3
+        codec2
         esp_codec_dev
         webrtc_ns
+        mbedtls
 )

@@ -4,7 +4,7 @@ Verified-but-deferred findings from the 2026-06-12 full-codebase
 review. The review's CONFIRMED findings (20 of 25 candidates) were
 fixed in the same pass — mesh failover/join/replay/phase-lock,
 mixer rider lifecycle, VAD-gated encode, session_fsm wiring, and the
-stale-comment/dead-API cleanup. What remains below are the four
+stale-comment/dead-API cleanup. What remains below are the three
 PLAUSIBLE findings (real mechanism, not currently biting or already
 mitigated) and the one REFUTED finding kept on file because it goes
 live when the BT phone link lands.
@@ -22,20 +22,7 @@ offset, under the `s_mac_mux` spinlock — this finding is closed as a
 side effect. Listed here so nobody "optimizes away" the critical
 section in `mesh_now_us()` without knowing what it prevents.
 
-### 2. Bitwise CRC-16 runs in the ESP-NOW recv callback
-
-`mesh_proto_crc16` is a bitwise (non-table) loop over 86 bytes
-(~700 iterations), executed per received packet inside the wifi
-task. Estimated cost is single-digit microseconds per packet on the
-LX6 at 240 MHz — about 0.2-0.6 % of one core at a full 8-rider mesh.
-It does not block or allocate, so it does not violate the recv-
-callback invariant; it is just work in a latency-sensitive context.
-If RX rates rise (9th beacon slot, larger groups), swap in a
-256-entry table (512 B rodata, ~8x cheaper) or verify the CRC on the
-drain side instead. The pure-C host-testability constraint of
-mesh_proto means the table belongs in mesh_proto.c, not an IDF API.
-
-### 3. Busy-wait slot alignment in mesh_tx_task
+### 2. Busy-wait slot alignment in mesh_tx_task
 
 The TX task aligns to its slot with `vTaskDelay` (1 ms granularity)
 plus an `esp_rom_delay_us` busy-wait for the remainder — worst case
@@ -47,7 +34,7 @@ the code: replace with an esp_timer one-shot + task notification.
 Worth doing before the BT Classic link adds Bluedroid load to
 core 0.
 
-### 4. codec_lc3_decode failure leaves the output buffer unwritten
+### 3. codec_lc3_decode failure leaves the output buffer unwritten
 
 `codec_lc3_decode` returns 0 without writing `out_pcm` on its guard
 failures and on `lc3_decode` rc < 0, and `mixer_pull` ignores the
@@ -62,7 +49,7 @@ return at the call sites.
 
 ## Refuted today, real later
 
-### 5. mixer_pull holds the mixer mutex across all LC3 decodes
+### 4. mixer_pull holds the mixer mutex across all LC3 decodes
 
 `mixer_pull` holds `s_mtx` across up to 8 LC3 decodes plus the
 duck/sum loops — potentially several milliseconds. Refuted as a bug

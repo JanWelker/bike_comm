@@ -19,8 +19,12 @@
 
 #define MESH_PROTO_MAX_RIDERS         8
 #define MESH_PROTO_LC3_BYTES          40
-#define MESH_PROTO_FRAME_BYTES        88          /* full on-air frame   */
-#define MESH_PROTO_CRC_COVER_BYTES    86          /* bytes 0..85         */
+#define MESH_PROTO_BODY_BYTES         86          /* plaintext frame body */
+#define MESH_PROTO_MIC_BYTES          16          /* AES-128-CCM tag      */
+#define MESH_PROTO_NONCE_LO_BYTES     4           /* per-device counter   */
+#define MESH_PROTO_WIRE_BYTES         (MESH_PROTO_NONCE_LO_BYTES + \
+                                       MESH_PROTO_BODY_BYTES +     \
+                                       MESH_PROTO_MIC_BYTES)        /* 106 */
 
 /* Beacons carry the low 3 bytes of each claimed slot's MAC so riders
  * can detect a stolen or double-allocated slot (not just a cleared
@@ -40,7 +44,22 @@
 
 #define MESH_PROTO_BEACON_MAGIC      0xB1
 
-/* ---- on-air frame layout (packed, little-endian) ---- */
+/* ---- on-air layout (packed, little-endian) ----
+ *
+ *   mesh_wire_t (106 B on air) =
+ *      nonce_lo   (4 B, cleartext but covered by the MIC as AAD)
+ *      cipher     (86 B, AES-128-CCM encryption of mesh_frame_t)
+ *      mic        (16 B, AES-128-CCM auth tag)
+ *
+ * The CCM nonce reconstructed by the receiver is
+ *      src_mac (6) || 0 (3) || nonce_lo (4)             = 13 B
+ * The key is the 16 B group PSK (installed at boot from NVS).
+ *
+ * mesh_frame_t below is the *plaintext* body — exactly what gets
+ * encrypted and what comes out of decryption. mesh_mac never serialises
+ * a mesh_frame_t directly onto the air; everything goes through the
+ * mesh_crypto layer.
+ */
 
 typedef struct __attribute__((packed)) {
     uint8_t  rider_id;                            /* 0..7                  */
@@ -53,17 +72,25 @@ typedef struct __attribute__((packed)) {
     uint8_t  lc3_prev[MESH_PROTO_LC3_BYTES];      /* previous 10 ms voice,
                                                      gated by
                                                      LC3_PREV_VALID flag   */
-    uint16_t crc;                                 /* CRC-16/CCITT-FALSE    */
 } mesh_frame_t;
 
-_Static_assert(sizeof(mesh_frame_t) == MESH_PROTO_FRAME_BYTES,
-               "mesh_frame_t must equal MESH_PROTO_FRAME_BYTES on the wire");
+_Static_assert(sizeof(mesh_frame_t) == MESH_PROTO_BODY_BYTES,
+               "mesh_frame_t must equal MESH_PROTO_BODY_BYTES (plaintext body)");
 
-/* ---- beacon payload — overlays the lc3_prev slot (offset 46 .. 85)
- * when MESH_PROTO_FLAG_BEACON is set. The lc3 slot stays free for
- * audio, letting the coordinator transmit one mic frame on every
- * beacon-bearing slot 0 instead of going silent. LC3_PREV_VALID is
- * always cleared on beacons (lc3_prev is beacon payload, not audio). */
+typedef struct __attribute__((packed)) {
+    uint32_t nonce_lo;                            /* AAD, cleartext        */
+    uint8_t  cipher[MESH_PROTO_BODY_BYTES];       /* CCM-encrypted body    */
+    uint8_t  mic[MESH_PROTO_MIC_BYTES];           /* CCM auth tag          */
+} mesh_wire_t;
+
+_Static_assert(sizeof(mesh_wire_t) == MESH_PROTO_WIRE_BYTES,
+               "mesh_wire_t must equal MESH_PROTO_WIRE_BYTES on the wire");
+
+/* ---- beacon payload — overlays the lc3_prev slot (offset 46 .. 85 of
+ * the plaintext body) when MESH_PROTO_FLAG_BEACON is set. The lc3 slot
+ * stays free for audio, letting the coordinator transmit one mic frame
+ * on every beacon-bearing slot 0 instead of going silent. LC3_PREV_VALID
+ * is always cleared on beacons (lc3_prev is beacon payload, not audio). */
 
 typedef struct __attribute__((packed)) {
     uint8_t  magic;                               /* MESH_PROTO_BEACON_MAGIC */
@@ -86,10 +113,6 @@ typedef struct __attribute__((packed)) {
 _Static_assert(sizeof(mesh_beacon_t) == MESH_PROTO_LC3_BYTES,
                "mesh_beacon_t must fit in lc3_prev space (= LC3 frame size)");
 
-/* ---- CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflect) ---- */
-
-uint16_t mesh_proto_crc16(const uint8_t *data, size_t len);
-
 /* ---- Anti-replay ----
  *
  * Accept new_seq iff it is strictly newer than last_seq in 16-bit
@@ -103,6 +126,12 @@ uint16_t mesh_proto_crc16(const uint8_t *data, size_t len);
  * stays deaf until the quiet-timeout tears the peer down. Replayed
  * recordings still fail (their seq is <= last seen). The first frame
  * from a rider (no last_seq yet) is the caller's responsibility.
+ *
+ * Post-MIC, this is in-session replay defence: a captured valid frame
+ * (the ciphertext + MIC together) is still a valid CCM, but its seq
+ * and per-rider monotonic nonce_lo are both replay-detectable. mesh_mac
+ * also tracks the highest seen nonce_lo per peer slot for tighter
+ * cross-seq-reset replay defence.
  */
 bool mesh_proto_seq_accept(uint16_t last_seq, uint16_t new_seq);
 

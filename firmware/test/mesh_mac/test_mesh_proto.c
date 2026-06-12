@@ -25,47 +25,6 @@ static int tests_passed = 0;
 } while (0)
 
 /* ------------------------------------------------------------------ */
-/* CRC-16/CCITT-FALSE                                                  */
-/* ------------------------------------------------------------------ */
-
-TEST(test_crc_kat_123456789)
-{
-    /* Canonical CCITT-FALSE test vector: "123456789" → 0x29B1. */
-    const uint8_t v[] = "123456789";
-    uint16_t crc = mesh_proto_crc16(v, 9);
-    assert(crc == 0x29B1);
-}
-
-TEST(test_crc_kat_empty)
-{
-    /* Empty input → init value, 0xFFFF. */
-    uint16_t crc = mesh_proto_crc16((const uint8_t *)"", 0);
-    assert(crc == 0xFFFF);
-}
-
-TEST(test_crc_kat_A)
-{
-    /* Single byte "A" (0x41).
-     *
-     * Manual derivation:
-     *   crc = 0xFFFF ^ (0x41 << 8) = 0xBEFF
-     *   loop 8 bits, applying x^16+x^12+x^5+1 on top bit
-     *   → 0xB915 (verified against an external CCITT-FALSE calculator).
-     */
-    const uint8_t v[] = { 'A' };
-    uint16_t crc = mesh_proto_crc16(v, 1);
-    assert(crc == 0xB915);
-}
-
-TEST(test_crc_changes_on_bitflip)
-{
-    uint8_t a[8] = { 0,1,2,3,4,5,6,7 };
-    uint8_t b[8] = { 0,1,2,3,4,5,6,7 };
-    b[3] ^= 0x01;
-    assert(mesh_proto_crc16(a, 8) != mesh_proto_crc16(b, 8));
-}
-
-/* ------------------------------------------------------------------ */
 /* Anti-replay                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -170,9 +129,12 @@ TEST(test_coord_we_lose_to_lower_peer)
 TEST(test_wire_layout_sizes)
 {
     /* These are also _Static_asserts in the header, but re-check at
-     * runtime for documentation. Tied to 32 kbps LC3 (40 B frame). */
-    assert(sizeof(mesh_frame_t)  == 88);
+     * runtime for documentation. Tied to 32 kbps LC3 (40 B frame).
+     * mesh_frame_t is the *plaintext* body (86 B); mesh_wire_t is the
+     * on-air encrypted form (4 B nonce_lo + 86 B cipher + 16 B MIC). */
+    assert(sizeof(mesh_frame_t)  == 86);
     assert(sizeof(mesh_beacon_t) == 40);
+    assert(sizeof(mesh_wire_t)   == 106);
 }
 
 /* ------------------------------------------------------------------ */
@@ -181,11 +143,6 @@ int main(void)
 {
     printf("mesh_proto host tests\n");
     printf("=====================\n");
-
-    RUN(test_crc_kat_123456789);
-    RUN(test_crc_kat_empty);
-    RUN(test_crc_kat_A);
-    RUN(test_crc_changes_on_bitflip);
 
     RUN(test_replay_strict_increase);
     RUN(test_replay_stale_rejected);

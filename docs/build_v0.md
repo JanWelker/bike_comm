@@ -60,6 +60,12 @@ You should see `bike_comm starting (chip: ESP32 single-chip path)` and `bike_com
 
 - `audio_io` task stack must be **7 KB**. 4 KB overflows on LC3 encode + cross-core mesh mutex (manifests as a wild-PC `Guru Meditation IllegalInstruction` on core 0). 8 KB starts crowding internal RAM enough for `mesh_mac_start` to OOM.
 - The ESP-NOW recv callback runs in the wifi task and **cannot block or allocate**. `on_mesh_rx` in `main.c` only memcpys to a small struct and `xQueueSend`s with timeout 0; the audio_io task drains the queue.
+- **Both boards must share the same group PSK.** Mesh frames are AES-128-CCM authenticated with the 16 B PSK from NVS (`cfg/psk`). `nvs_cfg_init` auto-generates a random PSK on first boot if none is present, so two freshly-erased boards each end up with their own and silently MIC-fail every cross-board frame — they bootstrap as solo coordinator and never see a peer (symptom: `rx drain: r0=0 r1=0 ...` indefinitely). Provision a shared PSK by running `tools/psk_gen.py`, building an NVS image with `$IDF_PATH/components/nvs_flash/nvs_partition_generator/nvs_partition_gen.py generate <csv> <out.bin> 0x6000`, and `esptool.py -p /dev/cu.usbserial-XXXX write_flash 0x9000 <out.bin>` on both boards. CSV shape:
+  ```
+  key,type,encoding,value
+  cfg,namespace,,
+  psk,data,hex2bin,<32 hex chars>
+  ```
 
 ## Definition of done for v0
 

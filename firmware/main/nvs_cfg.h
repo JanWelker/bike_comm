@@ -25,6 +25,19 @@ esp_err_t nvs_cfg_init(void);
 esp_err_t nvs_cfg_get_psk(uint8_t out_psk[16]);
 esp_err_t nvs_cfg_set_psk(const uint8_t psk[16]);
 
+/* Reserve a contiguous range of mesh-crypto nonce_lo values for this
+ * boot.
+ *
+ * Reads the current watermark W from NVS (0 if missing), writes
+ * W + window back, and returns W as *out_start. The caller hands out
+ * values W..W+window-1 from RAM and must call again before exhausting
+ * the window. NVS writes are therefore amortised to one per `window`
+ * frames — at the default 1024 frames/window and 50 fps that's roughly
+ * one NVS write per 20 s of TX, well inside NVS wear budget. The
+ * watermark only ever advances, so (key, nonce) reuse across reboots
+ * is impossible even if the in-RAM counter resets to 0 every boot. */
+esp_err_t nvs_cfg_alloc_nonce_window(uint32_t window, uint32_t *out_start);
+
 esp_err_t nvs_cfg_get_phone_addr(esp_bd_addr_t *out);
 esp_err_t nvs_cfg_set_phone_addr(const esp_bd_addr_t *addr);
 esp_err_t nvs_cfg_clear_phone_addr(void);

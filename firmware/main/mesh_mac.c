@@ -9,6 +9,8 @@
 
 #include "mesh_mac.h"
 #include "mesh_proto.h"
+#include "mesh_crypto.h"
+#include "nvs_cfg.h"
 #include "codec.h"       /* for CODEC_FRAME_BYTES */
 
 #include <inttypes.h>
@@ -22,6 +24,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+
+/* Per-device nonce_lo window. Smaller = more NVS writes; larger =
+ * larger jump-forward on every reboot. 1024 keeps NVS writes to about
+ * one every 20 s at full 50 fps TX, with a 1024-frame post-reboot
+ * skip-ahead — well below any plausible reuse window. */
+#define MESH_NONCE_WINDOW   1024u
 
 static const char *TAG = "mesh";
 
@@ -104,6 +112,8 @@ static portMUX_TYPE s_mac_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* ---- local state (shared fields protected by s_mac_mux) ---- */
 static uint8_t  s_psk[16];
+static uint8_t  s_own_mac[6]   = {0};    /* full MAC; needed to build the
+                                            CCM nonce on every TX */
 static uint8_t  s_own_slot   = 0xFF;     /* 0xFF = not joined */
 static uint8_t  s_slot_map   = 0;        /* echoed by coordinator beacon */
 static uint8_t  s_group_version = 0;
@@ -113,11 +123,23 @@ static uint32_t s_coord_mac_low = 0xFFFFFFFFu;
 static uint16_t s_superframe_counter = 0;
 static uint16_t s_tx_seq = 0;
 
+/* TX-side nonce_lo allocator. The window is reserved in NVS at init
+ * and topped up before exhaustion (see ensure_nonce_capacity()). Only
+ * mesh_tx_task touches these — no mutex needed. */
+static uint32_t s_tx_nonce_lo   = 0;     /* next nonce_lo to issue */
+static uint32_t s_nonce_window_end = 0;  /* exclusive upper bound  */
+
 /* per-rider book-keeping (index = rider_id) */
 static uint16_t s_last_seq[MESH_MAX_RIDERS];
 static bool     s_seq_seen[MESH_MAX_RIDERS];
 static uint32_t s_peer_mac_low[MESH_MAX_RIDERS];
 static uint16_t s_peer_quiet_sframes[MESH_MAX_RIDERS];
+/* Per-peer in-RAM nonce_lo high-watermark. Tightens replay defence
+ * across a seq reset: even if s_seq_seen[rid] is cleared by a beacon-
+ * released slot or implicit-leave timeout, replays of pre-reset frames
+ * still carry nonce_lo <= the last value we saw and are rejected here.
+ * Only valid when s_seq_seen[rid] is true; reset together. */
+static uint32_t s_peer_max_nonce_lo[MESH_MAX_RIDERS];
 
 /* coordinator tracking */
 static uint16_t s_sframes_since_beacon = 0xFFFF;   /* large → "never heard" */
@@ -311,6 +333,7 @@ esp_err_t mesh_mac_init(const uint8_t group_psk[16])
     memset(s_seq_seen, 0, sizeof(s_seq_seen));
     memset(s_peer_mac_low, 0, sizeof(s_peer_mac_low));
     memset(s_peer_quiet_sframes, 0, sizeof(s_peer_quiet_sframes));
+    memset(s_peer_max_nonce_lo, 0, sizeof(s_peer_max_nonce_lo));
     s_tx_ring_head  = 0;
     s_tx_ring_count = 0;
     s_join_unacked  = false;
@@ -328,16 +351,43 @@ esp_err_t mesh_mac_init(const uint8_t group_psk[16])
     }
 
     /* Learn our own MAC. We do this *before* esp_now_init so a missing
-     * Wi-Fi driver fails noisily. */
-    uint8_t mac[6] = {0};
-    esp_err_t err = esp_efuse_mac_get_default(mac);
+     * Wi-Fi driver fails noisily. The full 6 B is kept for the CCM
+     * nonce; mac_low is used for slot-owner bookkeeping and coordinator
+     * election. */
+    esp_err_t err = esp_efuse_mac_get_default(s_own_mac);
     if (err != ESP_OK) return err;
-    s_our_mac_low = mac_low_from_bytes(mac);
+    s_our_mac_low = mac_low_from_bytes(s_own_mac);
     ESP_LOGI(TAG, "our mac_low = 0x%08lx", (unsigned long)s_our_mac_low);
+
+    /* App-layer AES-128-CCM. ESP-NOW's built-in CCM only covers unicast
+     * peers, so this is what actually protects the broadcast traffic.
+     * mesh_crypto holds independent encrypt/decrypt contexts so the TX
+     * task and the wifi-task recv callback never race on mbedtls state.
+     * See docs/mesh_protocol.md "Security" for the wire format. */
+    err = mesh_crypto_init(s_psk);
+    if (err != ESP_OK) return err;
+
+    /* Reserve the first per-boot nonce_lo window. The watermark in NVS
+     * only ever advances, so even if we reboot with the in-RAM counter
+     * back at 0 we can never reuse a (key, nonce) tuple — the new
+     * window starts past the previous boot's last allocation. */
+    err = nvs_cfg_alloc_nonce_window(MESH_NONCE_WINDOW, &s_tx_nonce_lo);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nonce window alloc failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    s_nonce_window_end = s_tx_nonce_lo + MESH_NONCE_WINDOW;
+    ESP_LOGI(TAG, "nonce window [%lu, %lu)",
+             (unsigned long)s_tx_nonce_lo,
+             (unsigned long)s_nonce_window_end);
 
     err = esp_now_init();
     if (err != ESP_OK) return err;
 
+    /* PMK install is preserved as defence in depth — if the broadcast
+     * topology is ever swapped for N unicast peers, the LMK derivation
+     * needs the PMK. It does nothing for broadcast (our actual path);
+     * confidentiality + integrity ride on mesh_crypto above. */
     err = esp_now_set_pmk(s_psk);
     if (err != ESP_OK) return err;
 
@@ -358,11 +408,14 @@ esp_err_t mesh_mac_init(const uint8_t group_psk[16])
      * encryption. See docs/mesh_protocol.md "Security" for the two
      * options (app-layer CCM vs. unicast-with-CCM) and the decision
      * gate (before any public/field deployment, well before v1). */
+    /* Broadcast peer. ESP-NOW won't apply its native CCM to a broadcast
+     * address, so encrypt=false is correct here — confidentiality +
+     * integrity are handled by mesh_crypto, not ESP-NOW. */
     esp_now_peer_info_t peer = {0};
     memcpy(peer.peer_addr, BROADCAST_MAC, 6);
     peer.channel = 0;          /* current channel */
     peer.ifidx   = WIFI_IF_STA;
-    peer.encrypt = false;      /* broadcast can't be CCM-encrypted */
+    peer.encrypt = false;
     err = esp_now_add_peer(&peer);
     if (err != ESP_OK && err != ESP_ERR_ESPNOW_EXIST) return err;
 
@@ -676,11 +729,37 @@ static void mesh_tx_task(void *arg)
 
         if (send_this_slot) {
             if (header_only) s_tx_seq += 1;
-            f.crc = mesh_proto_crc16((const uint8_t *)&f,
-                                     MESH_PROTO_CRC_COVER_BYTES);
+
+            /* Top up the nonce_lo window before we exhaust it. The
+             * window only ever advances; on failure we drop the frame
+             * rather than risk reusing a nonce. */
+            if (s_tx_nonce_lo >= s_nonce_window_end) {
+                uint32_t next = 0;
+                esp_err_t werr = nvs_cfg_alloc_nonce_window(
+                    MESH_NONCE_WINDOW, &next);
+                if (werr == ESP_OK) {
+                    s_tx_nonce_lo      = next;
+                    s_nonce_window_end = next + MESH_NONCE_WINDOW;
+                } else {
+                    ESP_LOGE(TAG, "nonce refill failed: %s",
+                             esp_err_to_name(werr));
+                    /* Skip TX this slot — nonce reuse is catastrophic. */
+                    sframes_since_tx++;
+                    goto post_tx;
+                }
+            }
+
+            mesh_wire_t wire;
+            uint32_t nonce_lo = s_tx_nonce_lo++;
+            esp_err_t cerr = mesh_crypto_encrypt(s_own_mac, nonce_lo,
+                                                 &f, &wire);
+            if (cerr != ESP_OK) {
+                ESP_LOGW(TAG, "encrypt failed: %d", (int)cerr);
+                goto post_tx;
+            }
             esp_err_t err = esp_now_send(BROADCAST_MAC,
-                                         (const uint8_t *)&f,
-                                         sizeof(f));
+                                         (const uint8_t *)&wire,
+                                         sizeof(wire));
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "esp_now_send: %d", err);
             }
@@ -694,6 +773,7 @@ static void mesh_tx_task(void *arg)
             ESP_LOGD(TAG, "tx skip: header-only silence (since_tx=%u)",
                      (unsigned)sframes_since_tx);
         }
+    post_tx:;  /* empty stmt — label can't directly precede a declaration in C17 */
 
         /* Sleep to the end of this superframe, then advance. */
         int64_t next_superframe = superframe_start + MESH_SUPERFRAME_US;
@@ -726,10 +806,11 @@ static void mesh_tx_task(void *arg)
             s_peer_quiet_sframes[i]++;
             if (s_peer_quiet_sframes[i] >= MESH_PEER_QUIET_SFRAMES) {
                 mesh_proto_slot_release(&s_slot_map, (uint8_t)i);
-                s_peer_mac_low[i] = 0;
+                s_peer_mac_low[i]       = 0;
                 s_peer_quiet_sframes[i] = 0;
-                s_seq_seen[i] = false;
-                dropped[n_dropped++] = (uint8_t)i;
+                s_seq_seen[i]           = false;
+                s_peer_max_nonce_lo[i]  = 0;
+                dropped[n_dropped++]    = (uint8_t)i;
             }
         }
         portEXIT_CRITICAL(&s_mac_mux);
@@ -801,6 +882,7 @@ static void mesh_tx_task(void *arg)
             s_peer_mac_low[0]       = 0;
             s_peer_quiet_sframes[0] = 0;
             s_seq_seen[0]           = false;
+            s_peer_max_nonce_lo[0]  = 0;
             mesh_proto_slot_claim(&s_slot_map, 0);
             s_own_slot      = 0;
             s_coord_mac_low = s_our_mac_low;
@@ -825,17 +907,24 @@ static void mesh_tx_task(void *arg)
 static void on_esp_now_recv(const esp_now_recv_info_t *info,
                             const uint8_t *data, int len)
 {
-    if (len != (int)sizeof(mesh_frame_t)) return;
+    if (len != (int)sizeof(mesh_wire_t)) return;
+    if (!info || !info->src_addr) return;
 
-    const mesh_frame_t *f = (const mesh_frame_t *)data;
-
-    /* CRC. */
-    uint16_t want = mesh_proto_crc16(data, MESH_PROTO_CRC_COVER_BYTES);
-    if (want != f->crc) {
-        ESP_LOGD(TAG, "crc mismatch from rider %u (have 0x%04x want 0x%04x)",
-                 f->rider_id, f->crc, want);
-        return;
+    /* Decrypt + verify. CCM rejects every byte until the MIC checks
+     * out: a frame from a non-PSK attacker, a bit-flipped frame, and a
+     * cross-key replay all fail here and never touch any state below.
+     * mbedtls CCM is synchronous and allocation-free — safe in the
+     * wifi-task recv callback. */
+    mesh_frame_t pt;
+    {
+        const mesh_wire_t *wire = (const mesh_wire_t *)data;
+        if (mesh_crypto_decrypt(info->src_addr, wire, &pt) != ESP_OK) {
+            return;
+        }
     }
+    const mesh_frame_t *f = &pt;
+    const uint32_t  rx_nonce_lo = ((const mesh_wire_t *)data)->nonce_lo;
+    const uint32_t  src_mac_low = mac_low_from_bytes(info->src_addr);
 
     uint8_t rid = f->rider_id;
     if (rid >= MESH_MAX_RIDERS) return;
@@ -853,6 +942,17 @@ static void on_esp_now_recv(const esp_now_recv_info_t *info,
     if (f->flags & MESH_PROTO_FLAG_BEACON) {
         memcpy(&b, &f->lc3_prev[0], sizeof(b));
         is_beacon = (b.magic == MESH_PROTO_BEACON_MAGIC);
+        /* A beacon's coord_mac_low must match the actual src_addr it
+         * arrived on. With MIC verify already passed, the only way to
+         * forge this would be a PSK-holder masquerading as another
+         * rider's coord — still in-group, but pinning the identity to
+         * the L2 source closes the impersonation gap. */
+        if (is_beacon && b.coord_mac_low != src_mac_low) {
+            ESP_LOGD(TAG, "beacon coord_mac_low 0x%08lx != src 0x%08lx",
+                     (unsigned long)b.coord_mac_low,
+                     (unsigned long)src_mac_low);
+            return;
+        }
     }
 
     /* A frame in our own slot is either a rival coordinator's beacon
@@ -867,32 +967,57 @@ static void on_esp_now_recv(const esp_now_recv_info_t *info,
         return;
     }
 
-    /* Anti-replay (skip on first-ever frame from this rider), then
-     * per-rider bookkeeping. Accepted frames are the only liveness
-     * credit — replayed duplicates don't reset the quiet counter. */
+    /* MAC binding + anti-replay (seq and nonce_lo) + per-rider
+     * bookkeeping. All under one critical section so a parallel TX-task
+     * housekeeping pass can't observe a partial update.
+     *
+     * MAC binding: the first frame accepted on slot rid pins the peer's
+     * L2 source MAC. Every subsequent frame must match. With MIC verify
+     * already passed, this catches a PSK-holding insider that tries to
+     * impersonate another rider's slot without also spoofing their MAC.
+     *
+     * nonce_lo monotonicity: even if s_seq_seen[rid] is later cleared
+     * (slot release via beacon, quiet-timeout, LEAVE), in-RAM
+     * s_peer_max_nonce_lo still rejects any captured pre-reset frame —
+     * the sender's nonce_lo only ever advances and can't be replayed
+     * downward. Reset together with s_seq_seen.
+     */
     bool     had_seq;
     uint16_t prev_last_seq;
-    bool     accepted;
+    bool     accepted = false;
+    bool     mac_mismatch = false;
+    bool     nonce_replay = false;
     portENTER_CRITICAL(&s_mac_mux);
     had_seq       = s_seq_seen[rid];
     prev_last_seq = s_last_seq[rid];
-    accepted      = !had_seq || mesh_proto_seq_accept(prev_last_seq, f->seq);
-    if (accepted) {
-        s_last_seq[rid] = f->seq;
-        s_seq_seen[rid] = true;
-        s_peer_quiet_sframes[rid] = 0;
-        /* Track this peer's MAC-low (from info->src_addr). First
-         * claimant wins: a colliding transmitter must not overwrite
-         * the recorded owner, or the beacon's slot_owner would flap
-         * between the two and both sides would renegotiate forever. */
-        if (s_peer_mac_low[rid] == 0 && info && info->src_addr) {
-            s_peer_mac_low[rid] = mac_low_from_bytes(info->src_addr);
+    if (had_seq) {
+        if (s_peer_mac_low[rid] != src_mac_low) {
+            mac_mismatch = true;
+        } else if (rx_nonce_lo <= s_peer_max_nonce_lo[rid]) {
+            nonce_replay = true;
+        } else if (mesh_proto_seq_accept(prev_last_seq, f->seq)) {
+            accepted = true;
         }
+    } else {
+        /* First-ever frame from this slot. MIC verify proves the sender
+         * holds the PSK; we pin their MAC here so any later attempt to
+         * take over the slot from a different src_mac is rejected. */
+        accepted = true;
+        s_peer_mac_low[rid] = src_mac_low;
+    }
+    if (accepted) {
+        s_last_seq[rid]           = f->seq;
+        s_seq_seen[rid]           = true;
+        s_peer_quiet_sframes[rid] = 0;
+        s_peer_max_nonce_lo[rid]  = rx_nonce_lo;
     }
     portEXIT_CRITICAL(&s_mac_mux);
     if (!accepted) {
-        ESP_LOGD(TAG, "replay drop rider=%u last=%u new=%u",
-                 rid, prev_last_seq, f->seq);
+        ESP_LOGD(TAG, "drop rider=%u %s last_seq=%u new_seq=%u nonce=%lu",
+                 rid,
+                 mac_mismatch ? "mac mismatch"
+                              : (nonce_replay ? "nonce replay" : "stale seq"),
+                 prev_last_seq, f->seq, (unsigned long)rx_nonce_lo);
         return;
     }
 
@@ -928,6 +1053,7 @@ static void on_esp_now_recv(const esp_now_recv_info_t *info,
                     s_peer_mac_low[i]       = 0;
                     s_peer_quiet_sframes[i] = 0;
                     s_seq_seen[i]           = false;
+                    s_peer_max_nonce_lo[i]  = 0;
                     events[n_events].evt = MESH_EVT_PEER_LEFT;
                     events[n_events].rid = (uint8_t)i;
                     n_events++;
@@ -1025,12 +1151,18 @@ static void on_esp_now_recv(const esp_now_recv_info_t *info,
         }
     }
 
-    /* LEAVE flag: explicit departure. */
+    /* LEAVE flag: explicit departure.
+     *
+     * Only reached on a frame that passed MIC verify AND the
+     * MAC-binding check above, so an attacker who doesn't know the PSK
+     * (or who knows the PSK but uses a different src_mac than the
+     * slot's pinned owner) cannot forge a LEAVE for a victim rider. */
     if (f->flags & MESH_PROTO_FLAG_LEAVE) {
         portENTER_CRITICAL(&s_mac_mux);
         mesh_proto_slot_release(&s_slot_map, rid);
-        s_peer_mac_low[rid] = 0;
-        s_seq_seen[rid]     = false;
+        s_peer_mac_low[rid]      = 0;
+        s_seq_seen[rid]          = false;
+        s_peer_max_nonce_lo[rid] = 0;
         portEXIT_CRITICAL(&s_mac_mux);
         if (s_event_cb) {
             for (int i = 0; i < n_events; ++i) {

@@ -3,10 +3,16 @@
  *
  * Wire format (see docs/mesh_protocol.md for the canonical spec):
  *
- *   | 1 B rider_id (0..7) | 1 B flags (VAD|JOIN|LEAVE|BEACON|PREV) |
- *   | 2 B seq (of lc3)    | 2 B superframe_counter                |
- *   | 40 B lc3 (current)  | 40 B lc3_prev (current-1, gated PREV) |
- *   | 2 B CRC                                                     |
+ *   on-air mesh_wire_t (106 B) =
+ *     | 4 B nonce_lo (cleartext, covered by MIC as AAD)         |
+ *     | 86 B AES-128-CCM ciphertext of mesh_frame_t:            |
+ *     |   1 B rider_id (0..7)                                   |
+ *     |   1 B flags (VAD|JOIN|LEAVE|BEACON|PREV)                |
+ *     |   2 B seq (of lc3)                                      |
+ *     |   2 B superframe_counter                                |
+ *     |   40 B lc3 (current)                                    |
+ *     |   40 B lc3_prev (current-1, gated PREV)                 |
+ *     | 16 B CCM auth tag                                       |
  *
  * Each packet carries up to two LC3 frames so the 100 Hz mic encode
  * rate doesn't get halved by the 50 Hz slot cadence. lc3_prev's wire
@@ -22,13 +28,17 @@
  *     (which is stamped at the coordinator's superframe boundary)
  *
  * Security:
- *   - v0 traffic is plaintext on the wire. ESP-NOW's built-in AES-128-CCM
- *     only applies to unicast peers with encrypt=true; our flat broadcast
- *     topology can't use it. The 16 B group PSK is still installed via
- *     esp_now_set_pmk so the encrypted path (app-layer CCM, or N unicast
- *     peers) drops in without re-architecting. See docs/mesh_protocol.md
- *     "Security" for the post-v0 plan.
- *   - app-layer monotonic seq for anti-replay
+ *   - App-layer AES-128-CCM, key = 16 B group PSK from NVS, nonce =
+ *     src_mac (6) || 0 (3) || nonce_lo (4). nonce_lo is a per-device
+ *     monotonic counter watermarked in NVS with skip-ahead, so the
+ *     (key, nonce) pair never repeats — even across reboots. See
+ *     mesh_crypto.{h,c}.
+ *   - L2 src_mac is pinned to a slot on first frame and required to
+ *     match on every subsequent frame; a PSK-holding insider must
+ *     also spoof the MAC to impersonate another slot.
+ *   - Forward-only seq window plus a per-peer nonce_lo high-watermark
+ *     reject in-session replays AND post-seq-reset replays of captured
+ *     pre-reset frames.
  */
 
 #pragma once

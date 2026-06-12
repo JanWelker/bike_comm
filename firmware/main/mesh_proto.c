@@ -4,30 +4,6 @@
 
 #include "mesh_proto.h"
 
-/* ---- CRC-16/CCITT-FALSE -----------------------------------------------
- *
- * Bitwise implementation. The CRC covers MESH_PROTO_CRC_COVER_BYTES
- * (86) per frame; at 8 riders x 50 fps that's ~34 KB/s, single-digit
- * microseconds per packet on the LX6 — negligible, but note it runs
- * in the wifi task (recv callback). If RX rates ever rise, swap in a
- * 256-entry table.
- */
-uint16_t mesh_proto_crc16(const uint8_t *data, size_t len)
-{
-    uint16_t crc = 0xFFFF;
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (int b = 0; b < 8; ++b) {
-            if (crc & 0x8000) {
-                crc = (uint16_t)((crc << 1) ^ 0x1021);
-            } else {
-                crc = (uint16_t)(crc << 1);
-            }
-        }
-    }
-    return crc;
-}
-
 /* ---- Anti-replay ------------------------------------------------------ */
 
 bool mesh_proto_seq_accept(uint16_t last_seq, uint16_t new_seq)

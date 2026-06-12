@@ -297,11 +297,34 @@ void audio_pipeline_start(void)
      * hot path (Guru Meditation on core 0 via the cross-core mutex).
      * 6 KB survives queue_tx + drain. mixer_pull (LC3 decode + 160-
      * sample int32 accumulator + per-rider PCM buffer) needs more —
-     * trying 7 KB. 8 KB is the upper bound that still leaves enough
-     * internal RAM for mesh_tx_task to be created afterwards. */
+     * trying 7 KB. 8 KB was the upper bound under LC3 that still left
+     * enough internal RAM for mesh_tx_task. Codec2 digs deeper: its
+     * NLP/FFT path has stack-allocated float arrays sized off C2CONST
+     * (m_pitch, n_samp) plus kiss_fft temporaries. 7 KB overflows
+     * silently on Core 1 with wild-pointer Guru. With codec2 state in
+     * PSRAM the internal-RAM headroom is much wider, so we can give
+     * codec2 a 16 KB stack. */
+#if CONFIG_BIKE_CODEC_CODEC2
+    /* Codec2's NLP/FFT/quantise paths have lots of stack-allocated
+     * float arrays. Trial results on LX6:
+     *   - 7 KB / 16 KB: overflowed on decode side at runtime.
+     *   - 32 KB: no single contiguous block of that size in internal
+     *     DRAM, task create failed outright.
+     *   - PSRAM stack via xTaskCreatePinnedToCoreWithCaps: FreeRTOS
+     *     xPortcheckValidStackMem asserts on the LX6 (PSRAM stacks
+     *     aren't supported on the original ESP32's Xtensa port).
+     * 24 KB lands between the bookends — large enough for the decode
+     * path's peak, small enough to fit one of the D/IRAM segments.
+     * If the decode-side overflows again, the next step is splitting
+     * encode/decode into a separate codec2_worker task. */
+    const uint32_t LOOPBACK_STACK = 24576;
+#else
+    const uint32_t LOOPBACK_STACK = 7168;
+#endif
     BaseType_t ok = xTaskCreatePinnedToCore(loopback_task, "audio_loopback",
-                                            7168, NULL, LOOPBACK_TASK_PRIO,
-                                            NULL, AUDIO_CORE);
+                                            LOOPBACK_STACK, NULL,
+                                            LOOPBACK_TASK_PRIO, NULL,
+                                            AUDIO_CORE);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "loopback task create failed");
         s_running = false;

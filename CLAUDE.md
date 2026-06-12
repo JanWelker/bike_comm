@@ -44,6 +44,7 @@ mesh_proto layout-size assertion has caught silent rot before.
 | `firmware/main/main.c` | Init order, `on_mesh_rx` queue bridge, `mesh_rx_drain_to_mixer` |
 | `firmware/main/audio_pipeline.c` | LyraT-Mini v1.2 pin map, I2S setup, audio_io task (mic -> LC3 -> mesh + mixer pull -> spk) |
 | `firmware/main/mesh_mac.c` | TDMA scheduler, beacon, join, coord failover |
+| `firmware/main/mesh_crypto.c` | AES-128-CCM wrapper (separate encrypt/decrypt mbedtls contexts so TX task and wifi-task recv don't race) |
 | `firmware/main/codec_lc3.c` | liblc3 wrapper, pre-allocated encoder + 8 decoders |
 | `firmware/main/mixer.c`, `mixer_jb.c` | Per-rider jitter buffer + summing mixer |
 | `firmware/main/coex.c` | Wi-Fi + BT coexistence tuning (single-radio risk lives here) |
@@ -130,6 +131,27 @@ mesh_proto layout-size assertion has caught silent rot before.
   build. The `storage` spiffs partition is now 124 KB (was 252 KB
   before the codec2 resize, 380 KB pre-WebRTC_NS) — further shrink
   possible if a much bigger component lands.
+- **PSK must be provisioned identically on every board.** Mesh frames
+  are AES-128-CCM authenticated with the 16 B group PSK from NVS
+  (`cfg/psk`). `nvs_cfg_init` auto-generates a random PSK on first
+  boot if missing, so two freshly-erased boards each end up with
+  their own and every cross-board frame silently MIC-fails — they
+  bootstrap as solo coordinator and never see a peer. Provision a
+  shared PSK with `tools/psk_gen.py`, build an NVS image via
+  `nvs_partition_gen.py`, and `esptool.py write_flash 0x9000` on
+  both boards. Wire format is 106 B `mesh_wire_t` on the air;
+  86 B `mesh_frame_t` is the plaintext body.
+- **PSRAM-backed FreeRTOS task stacks fail on LX6.** `xTaskCreate
+  PinnedToCoreWithCaps(... MALLOC_CAP_SPIRAM)` asserts at task-create
+  time in FreeRTOS `xPortcheckValidStackMem` — the original ESP32
+  Xtensa port doesn't support PSRAM stacks. Big task stacks must
+  live in internal DRAM (or get split into a worker-task pipeline).
+  Related: `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384` pins every
+  allocation ≤ 16 KB to internal DRAM regardless of PSRAM caps —
+  components that do many small mallocs (codec2 is the example) need
+  a custom `heap_caps_malloc(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)`
+  wrapper to actually land in PSRAM. See `firmware/components/
+  codec2/codec2_alloc.c` for the pattern.
 - **Wi-Fi must stay in `WIFI_MODE_STA` once BT Classic is on.**
   Espressif's coexist.html marks ESP-NOW RX as `S` (stable in STA
   mode only) under all BR/EDR coexistence states; APSTA/AP modes
@@ -246,32 +268,80 @@ dir.
   skip=… (X% silenced)` on each rider. Still needs a two-board soak
   to confirm coord-loss and peer-left timers stay quiet under
   sustained silence.
+- [x] **App-layer AES-128-CCM on every mesh frame.** Done; new
+  `mesh_crypto.{h,c}` wrapping mbedtls (separate encrypt/decrypt
+  contexts so the wifi-task recv callback and `mesh_tx_task` never
+  race on mbedtls state). Wire format: `mesh_wire_t` = 4 B nonce_lo
+  + 86 B ciphertext + 16 B MIC = 106 B (was 88 B with CRC). Nonce
+  = `src_mac(6) || 0(3) || nonce_lo(4)`; `nonce_lo` is a per-device
+  monotonic counter watermarked in NVS (`cfg/nonce_hi`) with 1024-
+  frame skip-ahead, so `(key, nonce)` reuse is impossible across
+  reboots even if the in-RAM counter resets to 0. L2 src_mac is
+  pinned per slot on first accepted frame and required to match
+  thereafter; beacon `coord_mac_low` must equal the L2 source.
+  Per-peer `nonce_lo` high-watermark closes the post-seq-reset
+  replay window. `mesh_proto_crc16` retired (MIC subsumes it).
+  Bench-soak passed 2026-06-12 with audio both directions, no MIC
+  failures, clean failover. See `docs/mesh_protocol.md` "Security".
 - [~] **Add Codec2 as a build-time alternate codec behind Kconfig.**
-  Scaffold done; upstream not yet vendored. What's in:
+  Scaffold + upstream vendoring + wrapper done; LX6 DRAM blocker.
+  What's in:
     - Partition resize: OTA slots 0x1D0000 → 0x1E0000 (`firmware/
-      partitions.csv`); LC3 build is back to 5% free.
-    - Codec abstraction `firmware/main/codec.h` with one API and
-      `CODEC_FRAME_BYTES/SAMPLES/SAMPLE_RATE_HZ/MAX_DECODERS`
-      consumed by every former `codec_lc3.h` call site.
-    - `codec_lc3.c` refactored to implement the new API; old
-      `codec_lc3.h` deleted.
+      partitions.csv`); LC3 build is back to 5% free, codec2 build
+      sits at 10% free.
+    - Codec abstraction `firmware/main/codec.h` with one API.
     - `Kconfig.projbuild` CHOICE `BIKE_CODEC = LC3 | CODEC2`
       (default LC3); `CMakeLists.txt` picks `codec_lc3.c` or
-      `codec_codec2.c` at configure time.
-    - `codec_codec2.c` stub: codec2 build links cleanly (saves
-      ~115 KB via `--gc-sections` because liblc3 falls out) but
-      `codec_init` aborts with a clear log until upstream lands.
-  What's next (separate diff because it's hundreds of files):
-    - Vendor `drowe67/codec2` at
-      `firmware/components/codec2/upstream/` with a component
-      CMakeLists building only the 3200 bps mode.
-    - Flesh out `codec_codec2.c`: pre-alloc 1x encoder + 8x decoders
-      in internal RAM, buffer two `CODEC_FRAME_SAMPLES` PCM ticks
-      per encode (20 ms), zero-pad the 8 B output into the 40 B
-      wire slot every other tick, return 0 on intermediate ticks.
-    - Measure on the LX6 bench; add a codec2 column to
-      `docs/codec_perf.md` and an A/B speech eval blurb to
-      `docs/build_v0.md`.
+      `codec_codec2.c` + `resampler_16_8.c` at configure time.
+    - `firmware/components/codec2/upstream/` — drowe67/codec2 v1.2.0
+      vendored as the 3200-mode subset (16 .c, 22 .h, plus generated
+      codebooks; non-3200 codebooks dropped because their ~400 KB
+      rodata overflowed DRAM). Mode select via component
+      `target_compile_definitions(CODEC2_MODE_EN_DEFAULT=0
+      CODEC2_MODE_3200_EN=1)` so other modes constant-fold out.
+    - `firmware/main/resampler_16_8.{c,h}` — 31-tap halfband Hamming-
+      windowed sinc, Q14, ~17 non-zero taps, bridges audio_pipeline's
+      16 kHz tick to codec2's 8 kHz core.
+    - `firmware/main/codec_codec2.c` — buffers two 10 ms ticks of
+      PCM, decimates to 8 kHz, codec2_encode → 8 B, zero-pads into
+      the 40 B wire slot every 2nd tick; decode mirrors with cache
+      for the second 10 ms half. Per-rider state.
+  - PSRAM allocator wired up: codec2 component compiles with
+    `-D__EMBEDDED__`, providing `codec2_malloc/calloc/free` that call
+    `heap_caps_malloc(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)`. Routes
+    the codec2 `MALLOC` macro (debug_alloc.h) plus the raw
+    malloc/free in `mbest.c`, `nlp.c`, and `kiss_fft.h`. The
+    `codec2_alloc.c` source lives in the component.
+  - main task stack bumped to 16 KB (codec2_create digs deep);
+    `audio_loopback` stack bumped to 24 KB on the CODEC2 build only.
+    Tried PSRAM stack via `xTaskCreatePinnedToCoreWithCaps` —
+    FreeRTOS `xPortcheckValidStackMem` asserts on the LX6 (PSRAM
+    stacks not supported on the original ESP32 Xtensa port).
+  **Bench-validated 2026-06-12** (LyraT-Mini, both directions):
+  - Codec2 mode 3200 PSRAM-resident, sustained speech:
+    - encode: ~12 ms mean / ~16 ms max per frame
+    - decode: ~13 ms mean / ~16 ms max (rare 40 ms warmup outliers)
+    - WebRTC_NS: ~2 ms mean / ~7 ms max
+  - audio_loopback tick budget is 10 ms; codec2 enc+dec+NS sustains
+    ~27 ms per active-speech tick → ~3× over budget. `task_wdt`
+    fires periodically on Core 1 (warning, not fatal). Audio is
+    audibly intelligible both ways with codec2's distinctive
+    vocoder character.
+  **Verdict: codec2 mode 3200 on PSRAM-resident state is functional
+  but not viable as a primary codec on the LX6.** To make it viable
+  needs either: hot-loop functions in IRAM (cache the FFT and quant
+  paths), split encode/decode across the two cores via a worker
+  task, or move to ESP32-S3 (LX7 + PIE vector ISA — Espressif's own
+  benchmarks suggest a ~5× speedup for LC3 on S3R8, similar gains
+  expected for codec2). Out of scope for v0; left in tree behind
+  the Kconfig switch as scaffolding for the move-to-S3 decision.
+  What's next when this is picked up:
+    - Move codec2 hot loops to IRAM (`IRAM_ATTR` on `quantise`,
+      `kiss_fft_work`, `sine`, `nlp` core functions) — or evaluate
+      what subset of state can stay in internal DRAM while bulk
+      buffers stay in PSRAM.
+    - Add a codec2 column to `docs/codec_perf.md` once the LX6
+      numbers are within budget.
 - [ ] **Vendor SpeexDSP** (from `rjsachse/ESP32-SpeexDSP/src/speex/`)
   for AEC + AGC + VAD — pull the C sources, not the Arduino wrapper.
   Matters once helmet speaker bleeds into mic. 3-5 days; DRAM audit

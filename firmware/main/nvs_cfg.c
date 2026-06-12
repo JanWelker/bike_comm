@@ -15,9 +15,10 @@
 
 static const char *TAG    = "cfg";
 static const char *NS     = "cfg";
-static const char *K_PSK  = "psk";
-static const char *K_BD   = "bd_addr";
-static const char *K_NICK = "nick";
+static const char *K_PSK   = "psk";
+static const char *K_BD    = "bd_addr";
+static const char *K_NICK  = "nick";
+static const char *K_NONCE = "nonce_hi";    /* mesh-crypto nonce_lo watermark */
 
 esp_err_t nvs_cfg_init(void)
 {
@@ -103,6 +104,42 @@ esp_err_t nvs_cfg_get_nickname(char out[17])
         return ESP_OK;
     }
     return err;
+}
+
+esp_err_t nvs_cfg_alloc_nonce_window(uint32_t window, uint32_t *out_start)
+{
+    if (window == 0 || out_start == NULL) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+
+    uint32_t w = 0;
+    err = nvs_get_u32(h, K_NONCE, &w);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        w   = 0;
+        err = ESP_OK;
+    }
+    if (err != ESP_OK) {
+        nvs_close(h);
+        return err;
+    }
+
+    /* Reserve [w, w+window). If the increment would wrap the 32-bit
+     * counter we refuse: rotating the PSK (and thus the key) is the
+     * only safe recovery. At 50 fps + 1024-window this is about
+     * 1300 years of continuous TX. */
+    if (window > UINT32_MAX - w) {
+        nvs_close(h);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    err = nvs_set_u32(h, K_NONCE, w + window);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) return err;
+
+    *out_start = w;
+    return ESP_OK;
 }
 
 esp_err_t nvs_cfg_set_nickname(const char *nickname)

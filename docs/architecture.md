@@ -25,7 +25,7 @@ Mixer + JB        N jitter buffers, decode pool, sum to speaker + AEC ref
 LC3 codec         google/liblc3 — 32 kbps, 10 ms, 16 kHz
 ESP-SR AFE        AEC + NS + VAD
 I2S audio I/O     INMP441 in, ES8388 out
-Transport         ESP-NOW MAC (TDMA), Bluedroid HFP+A2DP
+Transport         ESP-NOW MAC (TDMA + AES-128-CCM), Bluedroid HFP+A2DP
 Platform          FreeRTOS, NVS, coex
 ```
 
@@ -47,6 +47,7 @@ Platform          FreeRTOS, NVS, coex
 | `audio_pipeline.{c,h}` | I2S DMA + ESP-SR AFE |
 | `codec_lc3.{c,h}` | liblc3 wrapper, decoder pool |
 | `mesh_mac.{c,h}` | TDMA on ESP-NOW; see `mesh_protocol.md` |
+| `mesh_crypto.{c,h}` | AES-128-CCM wrapper (mbedtls); per-frame encrypt/auth |
 | `mixer.{c,h}` | Jitter buffers + summing mixer |
 | `bt_classic.{c,h}` | Bluedroid HFP-HF + A2DP-sink |
 | `session_fsm.{c,h}` | Arbitration policy |

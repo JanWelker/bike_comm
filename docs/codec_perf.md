@@ -1,4 +1,9 @@
-# LC3 codec cost on ESP32 LX6
+# Codec cost on ESP32 LX6
+
+Sections: [LC3](#lc3-numbers) (the daily driver) and
+[Codec2 mode 3200](#codec2-mode-3200-numbers) (build-time alternate).
+
+## Why this doc exists
 
 Espressif's `esp_audio_codec` performance tables are measured on
 ESP32-S3R8 (LX7 with PIE/vector ops) and **cannot** be transferred to
@@ -21,9 +26,9 @@ audio, no BT.
 - Operating point: 16 kHz mono, 10 ms frames, **32 kbps → 40 B per frame**.
 - liblc3 version: google/liblc3 v1.1.1 (vendored at
   `firmware/components/liblc3/upstream/`).
-- audio_io task: core 1, prio 22, 7 KB stack.
+- audio_io task: core 1, prio 22, 7 KB stack (LC3 build).
 
-## Numbers
+## LC3 numbers
 
 Three consecutive 10 s windows on each board. B1 was coord (lowest MAC,
 beaconing); B2 was joiner. Both boards encode at the full 100 fps mic
@@ -158,19 +163,76 @@ target is to fit:
 | Decode per active rider | ≤1.5 ms | ≤1.5 ms |
 | Total codec time per tick | ≤6 ms | ≤7 ms |
 
-Anything that fits these holes is a viable LC3 substitute. The
-research notes (`CLAUDE.md` → "Open work") flag Codec2 as the most
-promising candidate — measure it the same way before swapping.
+Anything that fits these holes is a viable LC3 substitute. Codec2
+mode 3200 was measured the same way — see below.
+
+## Codec2 mode 3200 numbers
+
+Bench-validated 2026-06-12 on the same two-board LyraT-Mini setup,
+codec2 selected via `CONFIG_BIKE_CODEC_CODEC2=y`. All codec2 state
+(encoder + 8 decoders) lives in PSRAM via the `__EMBEDDED__` hook
+in `firmware/components/codec2/codec2_alloc.c` (otherwise the many
+small mallocs stay in internal DRAM under the 16 KB
+`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` threshold and starve mbedtls).
+The audio_loopback task stack is bumped 7 KB → 24 KB on this build —
+codec2's NLP/FFT/quantise paths have stack-allocated float arrays
+that overflow 16 KB on the decode side; 32 KB exceeded the largest
+contiguous internal-DRAM block and `xTaskCreatePinnedToCoreWithCaps
+(... MALLOC_CAP_SPIRAM)` fails `xPortcheckValidStackMem` (PSRAM
+stacks not supported on the LX6 Xtensa port).
+
+Operating point: 8 kHz internal (codec2 native), 16 kHz audio
+pipeline via a 31-tap halfband resampler (`firmware/main/
+resampler_16_8.c`), one codec2 frame per 20 ms = 8 B → zero-padded
+into the 40 B wire slot every other tick.
+
+### Encode + Decode (per call, sustained speech, both boards)
+
+| Stage | Mean | Max |
+|---|---|---|
+| `codec2_encode` (per 20 ms frame) | ~12 ms | ~16 ms |
+| `codec2_decode` (per 20 ms frame) | ~13 ms | ~16 ms |
+| WebRTC NS (Analyze/2 + Process, 100 fps) | ~2 ms | ~7 ms |
+
+Decode max shows a warmup tail: 30-40 ms outliers in the first
+window or two after the first frames arrive (PSRAM cache cold);
+steady state settles at ~13-16 ms.
+
+### What this means for budgeting
+
+audio_loopback tick = 10 ms. Per tick during speech:
+
+- Worst combined: NS (~2) + codec2_encode (~12-16) + codec2_decode
+  (~12-16) = **~26-34 ms / tick**, ~3× over budget.
+- `task_wdt` fires periodically on Core 1 (warning, not fatal —
+  audio still flows, but IDLE on Core 1 can't pet the watchdog).
+
+Audio is intelligible end-to-end (peak speaker amplitudes 10 K+
+during speech, codec2's vocoder character clearly audible), so the
+codec layer works correctly. The DSP cost is what knocks it out:
+codec2 is ~25× LC3 on the LX6.
+
+### Verdict
+
+**Codec2 mode 3200 is functional but not viable as a primary codec
+on the LX6.** Kept in tree as scaffolding behind
+`CONFIG_BIKE_CODEC_CODEC2` for the move-to-S3 decision. To make it
+viable on the LX6 would need: hot loops in IRAM (cache-resident
+FFT/quant), encode/decode split across the two cores via a worker
+task, or PSRAM-resident state keyed to cache-line alignment plus
+the LX7+PIE vector ISA (so: ESP32-S3R8). Espressif's own LC3
+numbers on S3R8 suggest a ~5× speedup for the FFT-heavy paths;
+codec2 should see similar gains.
 
 ## Re-running the measurement
 
-The counters live in `codec_lc3.c` (LC3) and `audio_pipeline.c` (NS)
-and log via the audio_io task every 1000 frames
-(`codec_lc3_perf_log_and_reset` + the NS log block right after it).
+The counters live in `codec_lc3.c` / `codec_codec2.c` (codec) and
+`audio_pipeline.c` (NS) and log via the audio_io task every 1000
+frames (`codec_perf_log_and_reset` + the NS log block right after it).
 Cost is one `esp_timer_get_time` pair per codec/NS call (~1 µs each)
 — effectively free, so the instrumentation stays in tree.
 
 ```sh
 idf.py -p /dev/cu.usbserial-XXX monitor 2>&1 \
-    | grep -E 'lc3: enc|lc3: dec|audio: ns'
+    | grep -E 'lc3: enc|lc3: dec|codec2: enc|codec2: dec|audio: ns'
 ```

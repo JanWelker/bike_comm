@@ -18,17 +18,14 @@ menu "bike_comm"
                 Bench-validated; this is what the v0 mesh runs on.
 
         config BIKE_CODEC_CODEC2
-            bool "Codec2 3200 bps (drowe67/codec2) — STUB"
+            bool "Codec2 3200 bps (drowe67/codec2)"
             help
                 Build-time alternate for A/B speech eval and a future
                 6-8-rider bandwidth fallback. 8 B per 20 ms padded into
-                the 40 B wire slot every other tick. The upstream
-                drowe67/codec2 source is NOT yet vendored — selecting
-                this option compiles a stub that abort()s in codec_init
-                with a clear log. Use to verify build wiring; do not
-                flash for actual use until the upstream lands at
-                firmware/components/codec2/upstream/ and codec_codec2.c
-                grows past the stub.
+                the 40 B wire slot every other tick. Bridges the 16 kHz
+                audio pipeline to codec2's 8 kHz core with a 31-tap
+                halfband resampler (firmware/main/resampler_16_8.c).
+                Vendored at firmware/components/codec2/upstream/.
     endchoice
 
 endmenu
