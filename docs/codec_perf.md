@@ -53,23 +53,39 @@ active decoder**. Mean on B2 is ~250 µs lower because PLC frames
 (passed as `bytes=NULL`) are cheaper than real frames; back-of-envelope
 that puts PLC at ~500 µs.
 
-### WebRTC noise suppression (`WebRtcNs_Process`)
+### WebRTC noise suppression (`WebRtcNs_Analyze` + `WebRtcNs_Process`)
 
 After landing `cpuimage/WebRTC_NS` (mode = medium, 16 kHz, 10 ms /
 160-sample frames). Same instrumentation pattern in audio_pipeline.c
-— `esp_timer_get_time` around every `WebRtcNs_Process` call, logged
-every 1000 frames.
+— `esp_timer_get_time` around the NS calls, logged every 1000 frames.
+
+Process-only numbers (original measurement — NOTE: this configuration
+turned out to be broken; see below):
 
 | Board | Sample 1 mean / max | Sample 2 mean / max | Sample 3 mean / max |
 |---|---|---|---|
 | B1 (coord) | 1474 / 2394 µs | 1464 / 2305 µs | 1454 / 2425 µs |
 | B2 (joiner) | 1584 / 3262 µs | 1573 / 3143 µs | 1582 / 3292 µs |
 
-**NS is ~1.5 ms per 10 ms frame** = **15% of one core**. B2's max sits
-higher than B1's — likely the ESP-NOW RX interrupts disturbing wall-
-clock more on the joiner side (it receives slightly different traffic
-patterns than the coord). The mean is stable within ~10% across both
-boards.
+**Process-only is ~1.5 ms per 10 ms frame**, but Process alone never
+updates the speech-probability model (`priorSpeechProb` only updates
+inside `AnalyzeCore`), which left the VAD gate stuck shut — see the
+2026-06-12 entry in CLAUDE.md "Open work". `WebRtcNs_Analyze` must
+also run; every frame it costs ~2.6 ms extra (combined mean ~4.1 ms,
+max ~18 ms, pushing the speech-period tick to ~11.5 ms — over
+budget).
+
+Shipping configuration: **Analyze every 2nd frame + Process every
+frame**, measured 2026-06-12 under sustained speech:
+
+| Board | Combined NS mean / max (per tick, averaged) |
+|---|---|
+| B1/B2 | 2450-2718 / 5585-7183 µs |
+
+**NS is ~2.6 ms per 10 ms frame** = **26% of one core**. The
+probability model still updates 50x/s — orders of magnitude faster
+than the 500 ms VAD hold — and the noise estimate Process consumes
+lags at most one frame.
 
 Note: LC3 encode and decode means crept up slightly once NS was
 co-resident (encode ~4.1 → 4.5 ms, decode ~1.3 → 1.4 ms on B1). Most
@@ -81,29 +97,32 @@ do nudge the surrounding work.
 
 ## What this means for budgeting
 
-audio_io tick = 10 ms (mic DMA-gated). Per tick, with NS in the chain:
+audio_io tick = 10 ms (mic DMA-gated). Per tick, with NS in the chain,
+during speech (the worst case — VAD-inactive ticks skip the encode
+entirely, saving the full ~4.5 ms):
 
 | Stage | Cost on LX6 |
 |---|---|
-| WebRTC NS (always, 100 fps)             | ~1.5 ms |
-| LC3 encode (always, 100 fps)            | ~4.5 ms |
-| LC3 decode (1 active rider)             | ~1.4 ms |
-| **Subtotal DSP+codec, 2-rider mesh**    | **~7.4 ms / tick** |
+| WebRTC NS (Analyze/2 + Process, 100 fps) | ~2.6 ms |
+| LC3 encode (speech only, 100 fps)        | ~4.5 ms |
+| LC3 decode (1 active rider)              | ~1.4 ms |
+| **Subtotal DSP+codec, 2-rider mesh**     | **~8.5 ms / tick** |
 | Everything else (mic+spk DMA setup, mesh queue+drain, mixer math, JB, log) | ~ remainder |
-| **Total tick budget**                   | 10 ms |
+| **Total tick budget**                    | 10 ms |
 
-So at two riders we sit around **~74% of one core** in NS + codec
-combined. Headroom is real but not generous — the 10 ms tick can't
-absorb another comparable DSP block without restructuring (e.g.
-moving NS to its own task on the other core, or trimming the LC3
-encode cost).
+So at two riders we sit around **~85% of one core** in NS + codec
+combined while talking (measured 2026-06-12: tick ~10.0-10.15 ms
+under sustained speech; the I2S DMA backlog absorbs the residual
+percent and recovers in speech gaps). Quiet ticks run ~4 ms. There is
+NO headroom for another DSP block on core 1 during speech — AEC/AGC
+work must live on the other core or displace something.
 
 ### Scaling to 8 riders (worst case)
 
 With NS in the chain and **no VAD gating** (the mixer would decode all
 8 incoming streams every tick):
 
-- NS + 1 encode + 8 decodes × ~1.4 ms = 1.5 + 4.5 + 11.2 = **~17.2 ms**
+- NS + 1 encode + 8 decodes × ~1.4 ms = 2.6 + 4.5 + 11.2 = **~18.3 ms**
   → over budget.
 
 This is why VAD gating is non-negotiable for the v0.5 6-8 rider
@@ -111,13 +130,15 @@ target. With realistic call patterns (≤2 simultaneous active talkers)
 the worst case is:
 
 - NS + 1 encode + 2 real decodes + 6 PLC decodes (PLC ≈ 500 µs)
-  ≈ 1.5 + 4.5 + 2.8 + 3.0 = **~11.8 ms** → still over budget.
+  ≈ 2.6 + 4.5 + 2.8 + 3.0 = **~12.9 ms** → over budget. (Mitigated:
+  the mixer now caps PLC at 5 consecutive underruns per rider, so
+  silent/departed riders cost nothing in steady state.)
 
-With the mixer's current "skip decode when VAD inactive" path (which
+With the mixer's "skip decode when VAD inactive" path (which
 contributes silence at zero cost):
 
-- NS + 1 encode + 2 real decodes ≈ 1.5 + 4.5 + 2.8 = **~8.8 ms** →
-  fits, just barely.
+- NS + 1 encode + 2 real decodes ≈ 2.6 + 4.5 + 2.8 = **~9.9 ms** →
+  fits with no slack; one more simultaneous talker blows it.
 
 **Implication:** before going past ~4 active riders, the mixer must
 honour the VAD bit on the wire (it already does on the TX side; the

@@ -18,8 +18,11 @@ verified across tens of seconds of soak. No HFP/A2DP to the phone yet;
 that's the v0.5 piece.
 
 See [`docs/architecture.md`](docs/architecture.md) for the design,
-[`docs/mesh_protocol.md`](docs/mesh_protocol.md) for the wire spec, and
-[`docs/build_v0.md`](docs/build_v0.md) for the bench bring-up walkthrough.
+[`docs/mesh_protocol.md`](docs/mesh_protocol.md) for the wire spec,
+[`docs/build_v0.md`](docs/build_v0.md) for the bench bring-up
+walkthrough, and [`docs/known_issues.md`](docs/known_issues.md) for
+verified-but-deferred findings (and the conditions that make them
+relevant).
 
 ## Hardware
 

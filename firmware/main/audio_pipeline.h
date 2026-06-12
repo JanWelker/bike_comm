@@ -29,3 +29,11 @@
 
 esp_err_t audio_pipeline_init(void);
 void      audio_pipeline_start(void);
+
+/* Speaker output volume, in percent (0..100). Initial value is 100,
+ * set in audio_pipeline_start(). vol_step adds delta_pct, clamps into
+ * range, and pushes the new value to the ES8311 via esp_codec_dev.
+ * Safe to call from any task — the codec I/O is I2C, not in the audio
+ * hot loop. No-op before audio_pipeline_start() runs. */
+void audio_pipeline_vol_step(int delta_pct);
+int  audio_pipeline_get_vol_pct(void);

@@ -23,8 +23,9 @@ extern "C" {
 /* Slot count. Matches the existing MIXER_JITTER_FRAMES = 3 (30 ms). */
 #define MIXER_JB_SLOTS       3
 
-/* LC3 frame size at 32 kbps / 10 ms / 16 kHz. Duplicated from
- * codec_lc3.h to keep this header dependency-free for host tests. */
+/* Codec frame size on the wire. Duplicated from codec.h to keep this
+ * header dependency-free for host tests. Both codec backends (LC3 and
+ * the codec2 stub at the time of writing) pad to the same 40 B slot. */
 #define MIXER_JB_LC3_BYTES   40
 
 typedef struct {

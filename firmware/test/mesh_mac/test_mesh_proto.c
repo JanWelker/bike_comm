@@ -71,37 +71,40 @@ TEST(test_crc_changes_on_bitflip)
 
 TEST(test_replay_strict_increase)
 {
-    /* Strictly increasing seqs within window are accepted. */
-    assert( mesh_proto_seq_accept(100, 101, 16));
-    assert( mesh_proto_seq_accept(101, 110, 16));
+    /* Strictly increasing seqs are accepted. */
+    assert( mesh_proto_seq_accept(100, 101));
+    assert( mesh_proto_seq_accept(101, 110));
 }
 
 TEST(test_replay_stale_rejected)
 {
     /* Stale by 1 — same value — out-of-order rejected. */
-    assert(!mesh_proto_seq_accept(101, 100, 16));
-    assert(!mesh_proto_seq_accept(101, 101, 16));   /* duplicate */
-    assert(!mesh_proto_seq_accept(200, 100, 16));   /* far stale */
+    assert(!mesh_proto_seq_accept(101, 100));
+    assert(!mesh_proto_seq_accept(101, 101));   /* duplicate */
+    assert(!mesh_proto_seq_accept(200, 100));   /* far stale */
 }
 
-TEST(test_replay_future_in_window)
+TEST(test_replay_forward_resync)
 {
-    /* Future by 1 (and up to window) is accepted. */
-    assert( mesh_proto_seq_accept(100, 101, 16));
-    assert( mesh_proto_seq_accept(100, 116, 16));
-    /* Beyond the window — reject (treat as "way off, possibly attacker
-     * or stale"). */
-    assert(!mesh_proto_seq_accept(100, 117, 16));
+    /* Any forward jump is a resync — a TX gap longer than a bounded
+     * window must not deafen the receiver until quiet-timeout (the
+     * failure mode behind the reverted heartbeat trial). */
+    assert( mesh_proto_seq_accept(100, 101));
+    assert( mesh_proto_seq_accept(100, 116));
+    assert( mesh_proto_seq_accept(100, 117));            /* > old window */
+    assert( mesh_proto_seq_accept(100, 100 + 32767));    /* max forward  */
+    /* Half-space and beyond reads as "behind" — rejected. */
+    assert(!mesh_proto_seq_accept(100, (uint16_t)(100 + 32768)));
 }
 
 TEST(test_replay_wraparound)
 {
     /* last_seq = 0xFFFE, new_seq = 0x0001 → delta +3 → accepted. */
-    assert( mesh_proto_seq_accept(0xFFFE, 0x0001, 16));
+    assert( mesh_proto_seq_accept(0xFFFE, 0x0001));
     /* last_seq = 0x0001, new_seq = 0xFFF0 → delta -17 → rejected. */
-    assert(!mesh_proto_seq_accept(0x0001, 0xFFF0, 16));
+    assert(!mesh_proto_seq_accept(0x0001, 0xFFF0));
     /* last_seq = 0xFFFE, new_seq = 0xFFFE → duplicate → rejected. */
-    assert(!mesh_proto_seq_accept(0xFFFE, 0xFFFE, 16));
+    assert(!mesh_proto_seq_accept(0xFFFE, 0xFFFE));
 }
 
 /* ------------------------------------------------------------------ */
@@ -186,7 +189,7 @@ int main(void)
 
     RUN(test_replay_strict_increase);
     RUN(test_replay_stale_rejected);
-    RUN(test_replay_future_in_window);
+    RUN(test_replay_forward_resync);
     RUN(test_replay_wraparound);
 
     RUN(test_slot_claim_release);

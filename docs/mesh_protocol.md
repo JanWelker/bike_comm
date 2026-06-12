@@ -60,33 +60,93 @@ When `flags & BEACON`, the `lc3_prev` slot (offset 46..85) instead carries:
 offset  size  field
   46     1    BEACON_MAGIC    (0xB1)
   47     4    coord_mac_low   (lowest 4 bytes of coordinator MAC)
-  51     4    us_timestamp    (esp_timer_get_time() at TX start, modulo 2^32)
+  51     4    us_timestamp    (mesh time of this superframe's slot-0
+                               boundary, modulo 2^32)
   55     1    slot_map        (bit i = 1 if slot i is claimed)
   56     1    group_version   (bumped on PSK change, schema change, etc.)
-  57    29    reserved (zeros, for future fields)
+  57    24    slot_owner      (8 x 3 bytes: low 3 bytes of the owner MAC
+                               per claimed slot, big-endian; 0 = free or
+                               owner not yet learned)
+  81     5    reserved (zeros, for future fields)
 ```
 
 `LC3_PREV_VALID` is always cleared on beacon frames (those 40 B are beacon, not audio). The `lc3` slot still carries one audio frame, so the coordinator transmits one mic frame on every beacon-bearing slot 0 instead of going silent.
+
+`us_timestamp` does double duty: receivers slew their mesh clock toward it (value sync) AND re-derive their superframe grid from it (phase sync) — the timestamp is by definition a slot-0 boundary, so each rider's slot grid stays phase-locked to the coordinator's instead of free-running at a power-on-random 0..20 ms offset.
+
+`slot_owner` lets every rider verify its claim end-to-end: bit set + owner == us is the join ack; bit set + foreign owner means the slot was lost (join collision, handed away during an RF fade, or the rider is the yielding half of a dual-coordinator split) and triggers renegotiation; bit clear means the coordinator dropped us and we re-claim.
 
 Slot 0 alternates between beacon (even superframes) and audio (odd superframes). Beacon rate is 25 fps (one beacon every 40 ms); the coordinator-loss timer (10 superframes ≈ 200 ms) tolerates the wider gap. Coordinator audio rate is 75 fps (25 beacon-slot frames + 50 audio-slot frames per second) — see the asymmetry note below.
 
 ## Join
 
 1. Listen for ≥ 2 superframes (≥ 40 ms) to receive a beacon.
-2. Read `slot_map`; pick the lowest unset slot.
-3. In that slot, transmit a frame with `JOIN` flag set.
-4. Wait one superframe.
-5. If the next beacon's `slot_map` shows our bit set, we're in. Otherwise (collision with another joiner), back off `hash(MAC) mod 4` superframes and retry.
+2. Read `slot_map`; pick the lowest unset slot and commit locally.
+3. Transmit in that slot with the `JOIN` flag set — and keep setting it
+   on every frame until a beacon acks the claim (`slot_map` bit set AND
+   `slot_owner` == our MAC). A single lost JOIN frame therefore can't
+   leave the claim dangling.
+4. If a beacon shows our slot owned by someone else (concurrent joiner
+   won the race), renegotiate: pick the lowest free slot from that
+   beacon, claim it, keep the JOIN flag running. If no slot is free,
+   give up and go idle.
 
 ## Leave
 
 - Explicit: transmit one final frame with `LEAVE` flag set.
 - Implicit: any rider whose slot is silent for 10 superframes (200 ms) is dropped from the slot map by the next beacon.
+- Recovery: a rider that sees its own bit cleared in a beacon (RF fade
+  outlived the quiet timeout) re-claims the same slot via the JOIN
+  mechanism; a rider that sees its slot owned by another MAC
+  renegotiates a fresh slot. Receivers also clear per-rider state for
+  any slot a beacon reports as released, so a re-claimed slot starts
+  from a clean seq history.
+
+## Heartbeat (VAD-silent TX skip)
+
+VAD already gates the encoder so silent ticks don't burn LC3 cost, but
+without further gating the TX task still emits a header-only frame
+every superframe just to refresh peers' implicit-leave quiet counter.
+The heartbeat scheme drops those silent-slot transmissions on the
+floor and only forces a header-only TX every `K = 5` superframes
+(= 100 ms) as a slot-claim keep-alive.
+
+- `K` must be strictly less than `MESH_PEER_QUIET_SFRAMES` (10) so a
+  single lost heartbeat still has four superframes of headroom before
+  the receiver tears the peer down.
+- Coordinators never reach the heartbeat path: their beacon every
+  other superframe (40 ms cadence) already acts as keep-alive, so the
+  audio slots can be skipped outright during silence. Net coordinator
+  airtime during silence is one beacon every 40 ms instead of two
+  frames every 20 ms.
+- Signalling (JOIN/LEAVE/BEACON) and audio-bearing frames always
+  send, regardless of where we are in the heartbeat cycle.
+- `s_tx_seq` only advances when a frame actually radiates, so a
+  K-superframe gap doesn't burn through the 16-bit seq space.
+- Anti-replay accepts any strictly-forward seq delta, so the first
+  packet after a heartbeat gap re-syncs the receiver in one shot.
+
+A prior implementation of this scheme was reverted in 2026-06 because
+it interacted badly with three latent bugs (seq advancing on un-sent
+slots, a bounded 16-seq forward replay window = 8 superframes, and
+one-shot JOIN). All three were fixed in the 2026-06-12 review, which
+is what unblocks the heartbeat re-attempt.
 
 ## Coordinator failover
 
-- If no beacon is received for 5 superframes (100 ms), the next-lowest-MAC rider starts beaconing on the next slot 0.
-- A new coordinator that hears a *lower-MAC* coordinator's beacon yields immediately. Prevents flapping.
+- If no beacon is received for 10 superframes (200 ms — matches the
+  coordinator-loss timer; the beacon-bearing slot only fires every
+  other superframe) AND the rider is next-lowest-MAC, it takes the
+  coordinator role: it releases its old slot, force-releases and claims
+  slot 0, and starts beaconing on the next even superframe. The role is
+  welded to slot 0 so the beacon schedule never needs a second wake-up
+  inside the superframe.
+- A coordinator that hears a *lower-MAC* coordinator's beacon yields
+  immediately: it adopts that beacon's map and clock and renegotiates a
+  fresh slot for itself (its slot 0 now belongs to the winner). A
+  coordinator ignores beacons from *higher-MAC* coordinators — exactly
+  one side backs down. Prevents flapping and resolves simultaneous
+  bootstrap (two riders powered on inside the same listen window).
 
 ## Two LC3 frames per packet
 
@@ -101,7 +161,8 @@ each packet carries the **two most recent** LC3 frames:
 seq counter increments by 2 per dual-frame packet (by 1 on a packet
 with only `lc3` — first ever from a rider, or back-pressure shed the
 older). Header-only packets (JOIN/LEAVE/BEACON without audio) bump seq
-by 1.
+by 1, and only when the frame actually goes on air — a TX gap doesn't
+burn through the seq space.
 
 The receiver pushes `lc3_prev` first (so the JB sees frames in seq
 order), gated by the `LC3_PREV_VALID` flag and a duplicate check
@@ -139,7 +200,8 @@ Voice frames are loss-tolerant; late frames are useless. Retransmission would bl
   - (b) move from broadcast to N unicast peers with ESP-NOW's native CCM (each rider adds the other 7 as encrypted peers; PSK reuse is fine because ESP-NOW derives a per-peer LMK).
   Option (a) is simpler and preserves the broadcast topology; (b) is what the original spec assumed.
 - PSK is generated by `tools/psk_gen.py` and exchanged via QR code (or flashed via serial).
-- Anti-replay: receivers drop any frame with `seq` older than 2 superframes from the most-recent seen for that rider. This works against any attacker who can record-and-replay our traffic (and is the only adversarial defense in v0).
+- Anti-replay: receivers drop any frame whose `seq` is not strictly newer (16-bit wrap-aware) than the most-recent seen for that rider. Forward jumps of any size are accepted as a resync — a bounded forward window is a liveness trap: a TX gap longer than the window makes every subsequent frame land outside it too, deafening the receiver until the quiet-timeout tears the peer down. Replayed recordings still fail (their seq is ≤ last seen) unless the recording is more than half the 16-bit seq space (~5 min at speech rate) old — an accepted v0 weakness, given v0 traffic is plaintext anyway.
+- Mismatched `group_version` beacons are ignored (first heard beacon fixes the version), so two incompatible builds or two groups with different PSK epochs don't silently merge.
 
 ## Open issues (revisit during build)
 

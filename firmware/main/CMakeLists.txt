@@ -1,8 +1,18 @@
+# Codec backend is a Kconfig CHOICE (see Kconfig.projbuild). Exactly one
+# of codec_lc3.c / codec_codec2.c implements codec.h per build; the
+# unselected file would produce duplicate-symbol link errors so we
+# include only the chosen one.
+if(CONFIG_BIKE_CODEC_CODEC2)
+    set(CODEC_SRC "codec_codec2.c")
+else()
+    set(CODEC_SRC "codec_lc3.c")
+endif()
+
 idf_component_register(
     SRCS
         "main.c"
         "audio_pipeline.c"
-        "codec_lc3.c"
+        "${CODEC_SRC}"
         "mesh_mac.c"
         "mesh_proto.c"
         "mixer.c"
@@ -19,6 +29,7 @@ idf_component_register(
         esp_coex
         bt
         driver
+        esp_adc
         esp_driver_gpio
         esp_driver_i2c
         esp_driver_i2s

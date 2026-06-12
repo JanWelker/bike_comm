@@ -74,7 +74,7 @@
  */
 
 #include "audio_pipeline.h"
-#include "codec_lc3.h"
+#include "codec.h"
 #include "mesh_mac.h"
 #include "mixer.h"
 
@@ -102,6 +102,12 @@ extern void mesh_rx_drain_to_mixer(void);
 
 static const char *TAG = "audio";
 
+_Static_assert(AUDIO_FRAME_SAMPLES == CODEC_FRAME_SAMPLES &&
+               AUDIO_FRAME_SAMPLES == MIXER_PCM_SAMPLES,
+               "audio tick, codec, and mixer must share one frame size");
+_Static_assert(AUDIO_SR_HZ == CODEC_SAMPLE_RATE_HZ,
+               "audio sample rate must match the codec's");
+
 /* WebRTC_NS state — allocated in audio_pipeline_start. The struct is
  * ~20-25 KB so it goes to PSRAM by default (above our 16 KB
  * SPIRAM_MALLOC_ALWAYSINTERNAL threshold). NS only runs once per
@@ -113,7 +119,7 @@ static NsHandle *s_ns = NULL;
 
 /* Per-call wall-clock perf counters for WebRtcNs_Process, in the same
  * shape as codec_lc3's counters. Logged + reset every 1000 frames by
- * codec_lc3_perf_log_and_reset's neighbor below. */
+ * codec_perf_log_and_reset's neighbor below. */
 static int64_t  s_ns_us_sum = 0;
 static int64_t  s_ns_us_max = 0;
 static uint32_t s_ns_count  = 0;
@@ -122,18 +128,24 @@ static uint32_t s_ns_count  = 0;
  * part of its noise estimate; we ride along on it instead of running
  * a separate VAD. Above-threshold frames are "speech"; we then hold
  * the gate open for VAD_HOLD_FRAMES (= 500 ms at 100 fps) so word-
- * internal pauses don't toggle the wire bit. The output drives the
- * vad_active flag on mesh_mac_queue_tx — the receiver-side mixer
- * already honours the bit (it skips decode on VAD-inactive frames),
- * so this is a free CPU saving on RX. It does NOT yet skip TX of
- * silent slots; that'd break the 200 ms peer-quiet-timeout and needs
- * a heartbeat scheme — separate TODO. */
+ * internal pauses don't toggle the gate.
+ *
+ * VAD-inactive frames skip BOTH the LC3 encode (~4.5 ms of the 10 ms
+ * tick — the single largest line item in the core-1 budget) and the
+ * TX queue: the mesh task keeps sending header-only frames every
+ * superframe (the slot-claim / peer-quiet-timeout invariant), which
+ * the receiver's mixer turns into decoded-for-free silence. Skipping
+ * the encode leaves a small gap in the LC3 encoder's overlap history;
+ * the first frame after re-activation may carry a minor artifact —
+ * accepted trade-off. It does NOT yet skip the TX packet itself;
+ * that needs a heartbeat scheme — separate v0.5 TODO. */
 #define VAD_SPEECH_THRESHOLD   0.5f
 #define VAD_HOLD_FRAMES        50
 
 static int      s_vad_hold          = 0;
 static uint32_t s_vad_active_count  = 0;
 static uint32_t s_vad_total_count   = 0;
+static float    s_vad_prob_max      = 0.0f;   /* per diag window */
 
 /* ---- Board pinout (LyraT-Mini v1.2) ---- */
 #define I2C_SDA_GPIO            GPIO_NUM_18
@@ -189,6 +201,10 @@ static esp_codec_dev_handle_t  s_spk_dev = NULL;
 static esp_codec_dev_handle_t  s_mic_dev = NULL;
 
 static volatile bool           s_running     = false;
+
+/* Speaker output volume in percent. UI pokes this via
+ * audio_pipeline_vol_step; the loopback task never touches it. */
+static int                     s_spk_vol_pct = 100;
 
 /* ---- forward decls ---- */
 static esp_err_t init_i2c_bus(void);
@@ -248,8 +264,11 @@ void audio_pipeline_start(void)
     }
 
     /* Volume + gain tuned for v0 bench loopback. Mic at 33 dB stays
-     * a couple of dB clear of ES7243's 37.5 dB saturation ceiling. */
-    esp_codec_dev_set_out_vol(s_spk_dev, 100);
+     * a couple of dB clear of ES7243's 37.5 dB saturation ceiling.
+     * Speaker volume is mutable from the UI via vol_step; we apply the
+     * current value (initially 100 %) here so a pre-start step call
+     * still takes effect at start. */
+    esp_codec_dev_set_out_vol(s_spk_dev, s_spk_vol_pct);
     esp_codec_dev_set_in_gain(s_mic_dev, 33.0f);
 
     /* Speaker amp must be high to actually hear anything. */
@@ -290,6 +309,21 @@ void audio_pipeline_start(void)
         ESP_LOGI(TAG, "loopback task running on core %d", AUDIO_CORE);
     }
 }
+
+void audio_pipeline_vol_step(int delta_pct)
+{
+    int v = s_spk_vol_pct + delta_pct;
+    if (v < 0)   v = 0;
+    if (v > 100) v = 100;
+    if (v == s_spk_vol_pct) return;
+    s_spk_vol_pct = v;
+    if (s_spk_dev) {
+        esp_codec_dev_set_out_vol(s_spk_dev, v);
+    }
+    ESP_LOGI(TAG, "spk vol %d%%", v);
+}
+
+int audio_pipeline_get_vol_pct(void) { return s_spk_vol_pct; }
 
 /* ====================================================================== */
 /* setup helpers                                                          */
@@ -509,10 +543,32 @@ static esp_err_t init_codecs(void)
 /* loopback task                                                          */
 /* ====================================================================== */
 
-/* Diagnostic: when set, log per-frame mic peak and RMS once per second.
- * Useful for tuning gain on the bench. Cheap (one ESP_LOGI per second)
- * so it's left on by default for v0. */
+/* Diagnostic: when set, log mic/speaker peak and RMS once per second.
+ * Useful for tuning gain on the bench; left on by default for v0. The
+ * level scan runs only on the tick that logs (a 1-frame point sample —
+ * same information the per-frame scan produced, since only the logged
+ * frame's values were ever reported). */
 #define AUDIO_DIAG_MIC_LEVEL 1
+
+#if AUDIO_DIAG_MIC_LEVEL
+static void diag_log_level(const char *what, const int16_t *pcm,
+                           uint32_t *frame_counter)
+{
+    if ((++*frame_counter % 100) != 0) return;  /* every 1 s @ 10 ms frames */
+    int16_t peak = 0;
+    int64_t sum_sq = 0;
+    for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
+        int16_t s = pcm[i];
+        int16_t a = s < 0 ? -s : s;
+        if (a > peak) peak = a;
+        sum_sq += (int32_t)s * (int32_t)s;
+    }
+    uint32_t rms = (uint32_t)__builtin_sqrt((double)sum_sq /
+                                            AUDIO_FRAME_SAMPLES);
+    ESP_LOGI(TAG, "%s level: peak=%d rms=%lu", what, peak,
+             (unsigned long)rms);
+}
+#endif /* AUDIO_DIAG_MIC_LEVEL */
 
 static void loopback_task(void *arg)
 {
@@ -527,9 +583,8 @@ static void loopback_task(void *arg)
 
     /* Pre-allocate the LC3 encode buffer + the mixer pull buffer so we
      * don't hit malloc in the hot loop. */
-    uint8_t lc3_buf[LC3_FRAME_BYTES];
+    uint8_t lc3_buf[CODEC_FRAME_BYTES];
     int16_t spk_buf[AUDIO_FRAME_SAMPLES];
-    int16_t aec_ref[AUDIO_FRAME_SAMPLES];
 
     ESP_LOGI(TAG, "audio io: %d samples/frame @ %d Hz, mic->mesh + mixer->spk",
              AUDIO_FRAME_SAMPLES, AUDIO_SR_HZ);
@@ -547,30 +602,36 @@ static void loopback_task(void *arg)
         }
 #if AUDIO_DIAG_MIC_LEVEL
         {
-            static uint32_t s_frame_n = 0;
-            int16_t peak = 0;
-            int64_t sum_sq = 0;
-            for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
-                int16_t s = buf[i];
-                int16_t a = s < 0 ? -s : s;
-                if (a > peak) peak = a;
-                sum_sq += (int32_t)s * (int32_t)s;
-            }
-            if ((++s_frame_n % 100) == 0) {  /* every 1 s @ 10 ms frames */
-                uint32_t rms = (uint32_t)__builtin_sqrt(
-                        (double)sum_sq / AUDIO_FRAME_SAMPLES);
-                ESP_LOGI(TAG, "mic level: peak=%d rms=%lu", peak,
-                         (unsigned long)rms);
-            }
+            static uint32_t s_mic_diag_n = 0;
+            diag_log_level("mic", buf, &s_mic_diag_n);
         }
 #endif /* AUDIO_DIAG_MIC_LEVEL */
         /* Noise suppression in place between the mic capture and the
          * LC3 encode. WebRTC_NS operates on 10 ms / 160-sample int16
-         * blocks at 16 kHz — same cadence as our LC3 frame, so this
-         * is a single in-place-style call per mic frame. */
+         * blocks at 16 kHz — same cadence as our LC3 frame.
+         *
+         * Analyze must run for the speech/noise probability model
+         * (SpeechNoiseProb -> priorSpeechProb) to update — it only
+         * does so inside AnalyzeCore. Without it the prior stays at
+         * its 0.5 init forever and the VAD gate (strictly > 0.5)
+         * never opens — the bug that shipped the intercom mute.
+         *
+         * Analyze runs every 2nd frame: at ~2.6 ms per call on the
+         * LX6 the every-frame version pushed the speech-period tick
+         * to ~11.5 ms (over the 10 ms budget). At 50 updates/s the
+         * probability model still settles orders of magnitude faster
+         * than the 500 ms VAD hold; the noise estimate Process
+         * consumes just lags one frame. The ns perf counter below
+         * covers Analyze + Process together, so the logged mean is
+         * the true per-tick average. */
+        static bool s_ns_analyze_this_frame = true;
         int16_t *ns_in[1]  = { buf };
         int16_t *ns_out[1] = { buf };
         int64_t ns_t0 = esp_timer_get_time();
+        if (s_ns_analyze_this_frame) {
+            WebRtcNs_Analyze(s_ns, buf);
+        }
+        s_ns_analyze_this_frame = !s_ns_analyze_this_frame;
         WebRtcNs_Process(s_ns, (const int16_t *const *)ns_in, 1, ns_out);
         int64_t ns_dt = esp_timer_get_time() - ns_t0;
         s_ns_us_sum += ns_dt;
@@ -579,6 +640,7 @@ static void loopback_task(void *arg)
 
         /* VAD via WebRTC NS's internal speech probability + hold. */
         float speech_prob = WebRtcNs_prior_speech_probability(s_ns);
+        if (speech_prob > s_vad_prob_max) s_vad_prob_max = speech_prob;
         bool vad_active;
         if (speech_prob > VAD_SPEECH_THRESHOLD) {
             vad_active = true;
@@ -592,28 +654,21 @@ static void loopback_task(void *arg)
         s_vad_total_count++;
         if (vad_active) s_vad_active_count++;
 
-        codec_lc3_encode(buf, lc3_buf);
-        mesh_mac_queue_tx(lc3_buf, vad_active);
+        /* Encode + queue only speech frames. During silence the mesh
+         * task still claims our slot with header-only frames, so the
+         * ~4.5 ms encode would produce bytes nobody decodes — the
+         * receiver's mixer skips VAD-inactive payloads anyway. */
+        if (vad_active) {
+            codec_encode(buf, lc3_buf);
+            mesh_mac_queue_tx(lc3_buf, true);
+        }
         mesh_rx_drain_to_mixer();
 
-        mixer_pull(spk_buf, aec_ref);
+        mixer_pull(spk_buf, NULL /* aec_ref: no consumer until v0.5 AEC */);
 #if AUDIO_DIAG_MIC_LEVEL
         {
-            static uint32_t s_spk_n = 0;
-            int16_t peak = 0;
-            int64_t sum_sq = 0;
-            for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
-                int16_t s = spk_buf[i];
-                int16_t a = s < 0 ? -s : s;
-                if (a > peak) peak = a;
-                sum_sq += (int32_t)s * (int32_t)s;
-            }
-            if ((++s_spk_n % 100) == 0) {
-                uint32_t rms = (uint32_t)__builtin_sqrt(
-                        (double)sum_sq / AUDIO_FRAME_SAMPLES);
-                ESP_LOGI(TAG, "spk level: peak=%d rms=%lu", peak,
-                         (unsigned long)rms);
-            }
+            static uint32_t s_spk_diag_n = 0;
+            diag_log_level("spk", spk_buf, &s_spk_diag_n);
         }
 #endif
         /* LC3 + NS + VAD diagnostic log every 1000 frames (~10 s).
@@ -621,7 +676,7 @@ static void loopback_task(void *arg)
         {
             static uint32_t s_perf_n = 0;
             if ((++s_perf_n % 1000) == 0) {
-                codec_lc3_perf_log_and_reset();
+                codec_perf_log_and_reset();
                 if (s_ns_count > 0) {
                     ESP_LOGI(TAG, "ns: n=%u mean=%lld us max=%lld us",
                              (unsigned)s_ns_count,
@@ -630,13 +685,16 @@ static void loopback_task(void *arg)
                     s_ns_us_sum = 0; s_ns_us_max = 0; s_ns_count = 0;
                 }
                 if (s_vad_total_count > 0) {
-                    ESP_LOGI(TAG, "vad: %u/%u frames active (%u%%)",
+                    ESP_LOGI(TAG, "vad: %u/%u frames active (%u%%), "
+                             "max prob %d%%",
                              (unsigned)s_vad_active_count,
                              (unsigned)s_vad_total_count,
                              (unsigned)((100u * s_vad_active_count) /
-                                        s_vad_total_count));
+                                        s_vad_total_count),
+                             (int)(s_vad_prob_max * 100.0f));
                     s_vad_active_count = 0;
                     s_vad_total_count  = 0;
+                    s_vad_prob_max     = 0.0f;
                 }
             }
         }

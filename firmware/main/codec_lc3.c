@@ -1,17 +1,21 @@
 /*
- * codec_lc3 — thin wrapper over google/liblc3 (vendored at
- * firmware/components/liblc3/upstream).
+ * codec_lc3 — LC3 backend for the codec.h abstraction.
+ *
+ * Wraps google/liblc3 (vendored at firmware/components/liblc3/upstream).
+ * Selected at build time by CONFIG_BIKE_CODEC_LC3 (default); the codec2
+ * backend lives in codec_codec2.c and is mutually exclusive via
+ * firmware/main/CMakeLists.txt.
  *
  * Operating point: 16 kHz mono, 10 ms frames, 32 kbps → 40 B on air.
- * One shared encoder (TX); one decoder per active remote rider (RX),
- * allocated on demand into a fixed-size pool.
+ * One shared encoder (TX); one decoder per rider (RX), all
+ * pre-allocated at init (see the comment in codec_init).
  *
  * Memory: codec state is placed in internal RAM via heap_caps_malloc so
  * the hot encode/decode loops never touch PSRAM (which would crater
  * throughput on the original ESP32).
  */
 
-#include "codec_lc3.h"
+#include "codec.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -24,7 +28,7 @@
 static const char *TAG = "lc3";
 
 /* Wall-clock perf counters around each lc3_encode / lc3_decode call.
- * Reset on every codec_lc3_perf_log_and_reset() call. esp_audio_codec
+ * Reset on every codec_perf_log_and_reset() call. esp_audio_codec
  * only publishes S3R8 (LX7+PIE) numbers — these counters give us
  * actual LX6 figures from the LyraT-Mini bench. See docs/codec_perf.md. */
 static int64_t  s_enc_us_sum = 0;
@@ -40,7 +44,7 @@ typedef struct {
     void          *mem;     /* keep a copy for free() */
 } lc3_dec_slot_t;
 
-static lc3_dec_slot_t s_decoders[LC3_MAX_DECODERS];
+static lc3_dec_slot_t s_decoders[CODEC_MAX_DECODERS];
 static lc3_encoder_t  s_encoder;
 static void          *s_encoder_mem;
 
@@ -49,7 +53,37 @@ static void *codec_alloc(size_t n)
     return heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
 
-esp_err_t codec_lc3_init(void)
+static esp_err_t decoder_acquire(uint8_t rider_id)
+{
+    if (rider_id >= CODEC_MAX_DECODERS) return ESP_ERR_INVALID_ARG;
+    if (s_decoders[rider_id].in_use)    return ESP_OK;  /* idempotent */
+
+    unsigned sz = lc3_decoder_size(CODEC_FRAME_DUR_US, CODEC_SAMPLE_RATE_HZ);
+    if (sz == 0) return ESP_ERR_INVALID_ARG;
+
+    void *mem = codec_alloc(sz);
+    if (mem == NULL) {
+        ESP_LOGE(TAG, "decoder[%u] alloc failed (%u B)", rider_id, sz);
+        return ESP_ERR_NO_MEM;
+    }
+
+    lc3_decoder_t dec = lc3_setup_decoder(CODEC_FRAME_DUR_US,
+                                          CODEC_SAMPLE_RATE_HZ,
+                                          0, /* sr_pcm_hz=0 → same as sr_hz */
+                                          mem);
+    if (dec == NULL) {
+        heap_caps_free(mem);
+        return ESP_FAIL;
+    }
+
+    s_decoders[rider_id].in_use = true;
+    s_decoders[rider_id].dec    = dec;
+    s_decoders[rider_id].mem    = mem;
+    ESP_LOGI(TAG, "decoder[%u] acquired (%u B)", rider_id, sz);
+    return ESP_OK;
+}
+
+esp_err_t codec_init(void)
 {
     memset(s_decoders, 0, sizeof(s_decoders));
 
@@ -58,7 +92,7 @@ esp_err_t codec_lc3_init(void)
         return ESP_OK;
     }
 
-    unsigned sz = lc3_encoder_size(LC3_FRAME_DUR_US, LC3_SAMPLE_RATE_HZ);
+    unsigned sz = lc3_encoder_size(CODEC_FRAME_DUR_US, CODEC_SAMPLE_RATE_HZ);
     if (sz == 0) {
         ESP_LOGE(TAG, "lc3_encoder_size returned 0 (bad params)");
         return ESP_ERR_INVALID_ARG;
@@ -70,8 +104,8 @@ esp_err_t codec_lc3_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    s_encoder = lc3_setup_encoder(LC3_FRAME_DUR_US,
-                                  LC3_SAMPLE_RATE_HZ,
+    s_encoder = lc3_setup_encoder(CODEC_FRAME_DUR_US,
+                                  CODEC_SAMPLE_RATE_HZ,
                                   0, /* sr_pcm_hz=0 → same as sr_hz */
                                   s_encoder_mem);
     if (s_encoder == NULL) {
@@ -90,8 +124,8 @@ esp_err_t codec_lc3_init(void)
      * coordinator-lost timer on the other end. Doing it here trades
      * ~8 * lc3_decoder_size() = ~8 KB of internal RAM for a recv-path
      * that's free of allocations and any per-rider first-time cost. */
-    for (uint8_t r = 0; r < LC3_MAX_DECODERS; r++) {
-        esp_err_t err = codec_lc3_decoder_acquire(r);
+    for (uint8_t r = 0; r < CODEC_MAX_DECODERS; r++) {
+        esp_err_t err = decoder_acquire(r);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "pre-acquire decoder[%u] failed: %s", r,
                      esp_err_to_name(err));
@@ -101,15 +135,15 @@ esp_err_t codec_lc3_init(void)
     return ESP_OK;
 }
 
-size_t codec_lc3_encode(const int16_t pcm[LC3_PCM_SAMPLES],
-                        uint8_t out[LC3_FRAME_BYTES])
+size_t codec_encode(const int16_t pcm[CODEC_FRAME_SAMPLES],
+                    uint8_t out[CODEC_FRAME_BYTES])
 {
     if (s_encoder == NULL || pcm == NULL || out == NULL) {
         return 0;
     }
     int64_t t0 = esp_timer_get_time();
     int rc = lc3_encode(s_encoder, LC3_PCM_FORMAT_S16,
-                        pcm, 1 /* stride */, LC3_FRAME_BYTES, out);
+                        pcm, 1 /* stride */, CODEC_FRAME_BYTES, out);
     int64_t dt = esp_timer_get_time() - t0;
     s_enc_us_sum += dt;
     if (dt > s_enc_us_max) s_enc_us_max = dt;
@@ -118,58 +152,16 @@ size_t codec_lc3_encode(const int16_t pcm[LC3_PCM_SAMPLES],
         ESP_LOGW(TAG, "lc3_encode rc=%d", rc);
         return 0;
     }
-    return LC3_FRAME_BYTES;
+    return CODEC_FRAME_BYTES;
 }
 
-esp_err_t codec_lc3_decoder_acquire(uint8_t rider_id)
+size_t codec_decode(uint8_t rider_id,
+                    const uint8_t *bytes, size_t len,
+                    int16_t out_pcm[CODEC_FRAME_SAMPLES])
 {
-    if (rider_id >= LC3_MAX_DECODERS) return ESP_ERR_INVALID_ARG;
-    if (s_decoders[rider_id].in_use)  return ESP_OK;  /* idempotent */
-
-    unsigned sz = lc3_decoder_size(LC3_FRAME_DUR_US, LC3_SAMPLE_RATE_HZ);
-    if (sz == 0) return ESP_ERR_INVALID_ARG;
-
-    void *mem = codec_alloc(sz);
-    if (mem == NULL) {
-        ESP_LOGE(TAG, "decoder[%u] alloc failed (%u B)", rider_id, sz);
-        return ESP_ERR_NO_MEM;
-    }
-
-    lc3_decoder_t dec = lc3_setup_decoder(LC3_FRAME_DUR_US,
-                                          LC3_SAMPLE_RATE_HZ,
-                                          0, /* sr_pcm_hz=0 → same as sr_hz */
-                                          mem);
-    if (dec == NULL) {
-        heap_caps_free(mem);
-        return ESP_FAIL;
-    }
-
-    s_decoders[rider_id].in_use = true;
-    s_decoders[rider_id].dec    = dec;
-    s_decoders[rider_id].mem    = mem;
-    ESP_LOGI(TAG, "decoder[%u] acquired (%u B)", rider_id, sz);
-    return ESP_OK;
-}
-
-void codec_lc3_decoder_release(uint8_t rider_id)
-{
-    if (rider_id >= LC3_MAX_DECODERS) return;
-    if (!s_decoders[rider_id].in_use) return;
-
-    heap_caps_free(s_decoders[rider_id].mem);
-    s_decoders[rider_id].mem    = NULL;
-    s_decoders[rider_id].dec    = NULL;
-    s_decoders[rider_id].in_use = false;
-    ESP_LOGI(TAG, "decoder[%u] released", rider_id);
-}
-
-size_t codec_lc3_decode(uint8_t rider_id,
-                        const uint8_t *bytes, size_t len,
-                        int16_t out_pcm[LC3_PCM_SAMPLES])
-{
-    if (rider_id >= LC3_MAX_DECODERS) return 0;
-    if (!s_decoders[rider_id].in_use) return 0;
-    if (out_pcm == NULL)              return 0;
+    if (rider_id >= CODEC_MAX_DECODERS) return 0;
+    if (!s_decoders[rider_id].in_use)   return 0;
+    if (out_pcm == NULL)                return 0;
 
     /* Per liblc3: in=NULL triggers PLC; lc3_decode returns
      * 0 on success, 1 if PLC was operated, -1 on bad params. */
@@ -185,10 +177,10 @@ size_t codec_lc3_decode(uint8_t rider_id,
         ESP_LOGW(TAG, "lc3_decode rider=%u rc=%d", rider_id, rc);
         return 0;
     }
-    return LC3_PCM_SAMPLES;
+    return CODEC_FRAME_SAMPLES;
 }
 
-void codec_lc3_perf_log_and_reset(void)
+void codec_perf_log_and_reset(void)
 {
     if (s_enc_count > 0) {
         ESP_LOGI(TAG, "enc: n=%u mean=%lld us max=%lld us",

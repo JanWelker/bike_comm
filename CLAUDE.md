@@ -52,6 +52,7 @@ mesh_proto layout-size assertion has caught silent rot before.
 | `docs/mesh_protocol.md` | Wire format, slot math, beacon, failover |
 | `docs/build_v0.md` | Bench bring-up, gotchas, definition-of-done |
 | `docs/codec_perf.md` | Measured LC3 encode/decode cost on LX6 (LyraT-Mini bench) — the only LX6 codec numbers we have, since esp_audio_codec only publishes S3R8 |
+| `docs/known_issues.md` | Verified-but-deferred review findings + the trigger conditions that make them live (check before touching the recv path, the slot scheduler, or wiring the BT phone path) |
 | `tools/psk_gen.py` | Generate the 16 B group PSK |
 
 ## Hardware quirks worth knowing up front
@@ -66,6 +67,13 @@ mesh_proto layout-size assertion has caught silent rot before.
   signal.
 - **Speaker PA enable is GPIO21.** Drive it HIGH or the headphone jack
   is silent even though I2S is happily clocking.
+- **Six tactile buttons share GPIO39 as an ADC resistor ladder** (not
+  individual GPIOs). Per the v1.2 schematic, idle is ~3.15 V and the
+  per-key press voltages are VOL+ 0.38, VOL- 0.82, SET 1.18, PLAY 1.57,
+  MODE 1.98, REC 2.41 V. Decoded in `ui.c` with ~40 ms debounce. Only
+  VOL+ / VOL- emit events today (5 % step via
+  `audio_pipeline_vol_step`); the other four are recognized and logged
+  but ignored until `session_fsm_on_button` grows handlers.
 
 ## Critical gotchas (don't relearn these)
 
@@ -88,6 +96,17 @@ mesh_proto layout-size assertion has caught silent rot before.
   residual gap needs a dedicated 9th beacon slot (v0.5). Coord-loss
   timer is 10 superframes (200 ms) to tolerate the 40 ms inter-beacon
   gap — don't tighten without revisiting beacon cadence.
+- **Heartbeat: silent slots skip TX, claim refreshed every
+  `MESH_HEARTBEAT_SFRAMES` (5) superframes.** Joiners only radiate
+  when carrying audio, when JOIN/LEAVE/BEACON is pending, or once per
+  100 ms as a keep-alive. K must stay strictly under
+  `MESH_PEER_QUIET_SFRAMES` (10) so a single lost heartbeat doesn't
+  collapse the peer view. Three latent bugs (seq advancing on
+  un-sent, bounded forward replay window, one-shot JOIN) made the
+  first attempt at this break asymmetrically; all three are fixed
+  in code, so don't reintroduce them when tuning K. The
+  `tx 10s: audio=… hb=… skip=…` log line on each rider tells you
+  whether silence is actually saving airtime.
 - **LC3 codec state must live in internal RAM.** `heap_caps_malloc`
   with `MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT`. PSRAM access from the
   hot encode/decode loop craters throughput on the original ESP32.
@@ -99,15 +118,18 @@ mesh_proto layout-size assertion has caught silent rot before.
   `firmware/components/webrtc_ns/`) — BSD-3, single-TU float32 C,
   10 ms / 160-sample blocks that map 1:1 to our LC3 cadence. State
   is ~25 KB and lands in PSRAM via the default 16 KB threshold;
-  measured cost on LX6 is ~1.5 ms per 10 ms frame (see
-  `docs/codec_perf.md`).
-- **The app partition is ~97% full.** Each OTA slot is 0x1D0000
-  (1.875 MB, bumped this session from 1.75 MB to absorb WebRTC_NS);
-  the current binary fills it to ~3% free. Adding any further
-  managed component over a few tens of KB will overflow. The
-  `storage` spiffs partition at the end of flash is down to 252 KB
-  (was 380 KB before the WebRTC_NS bump) — still room to shrink it
-  further if a future big component lands.
+  measured cost on LX6 is ~2.6 ms per 10 ms frame (Analyze every
+  2nd frame + Process every frame — Analyze is REQUIRED or the VAD
+  probability stays pinned at 0.5; see `docs/codec_perf.md`).
+- **The app partition is ~95% full.** Each OTA slot is 0x1E0000
+  (1.9375 MB, bumped from 0x1D0000 to leave headroom for the
+  codec2 build-time alternate); the LC3 binary fills it to ~5%
+  free. The codec2 stub build sits at ~11% free because liblc3
+  falls out via `--gc-sections`. Adding any further managed
+  component over a few tens of KB will start to crowd the LC3
+  build. The `storage` spiffs partition is now 124 KB (was 252 KB
+  before the codec2 resize, 380 KB pre-WebRTC_NS) — further shrink
+  possible if a much bigger component lands.
 - **Wi-Fi must stay in `WIFI_MODE_STA` once BT Classic is on.**
   Espressif's coexist.html marks ESP-NOW RX as `S` (stable in STA
   mode only) under all BR/EDR coexistence states; APSTA/AP modes
@@ -180,11 +202,13 @@ dir.
 - [x] **Measure LC3 cost on LX6.** Done; see `docs/codec_perf.md`.
 - [x] **Vendor `cpuimage/WebRTC_NS` as the NS module.** Done; lives
   at `firmware/components/webrtc_ns/`, wired into `loopback_task`
-  between mic read and LC3 encode (mode = medium). Measured ~1.5 ms
-  per 10 ms frame on LX6; required a partition resize (OTA slots
-  bumped 1.75 → 1.875 MB) to fit. With NS landed the audio_io tick
-  sits at ~7.4 ms of 10 ms at 2 riders — further DSP additions will
-  need to live on the other core. See `docs/codec_perf.md`.
+  between mic read and LC3 encode (mode = medium). Measured ~2.6 ms
+  per 10 ms frame on LX6 (Analyze every 2nd frame + Process every
+  frame); required a partition resize (OTA slots bumped 1.75 →
+  1.875 MB) to fit. The speech-period audio_io tick sits at ~8.5 ms
+  of 10 ms at 2 riders (quiet ticks ~4 ms thanks to the VAD encode
+  skip) — further DSP additions must live on the other core. See
+  `docs/codec_perf.md`.
 - [x] **Adopt `Hemisphere-Project/ESPNowMeshClock`'s forward-only-
   slewed time-sync algorithm** for beacon resync. Done; reimplemented
   in `mesh_mac.c` (`mesh_now_us`, `MESH_CLOCK_*` constants) — no
@@ -192,34 +216,62 @@ dir.
   step threshold = 5 ms. First beacon snaps the joiner's clock to the
   coord's; subsequent ones slew silently. Verified: rx-drain rates
   stay at ~100/75 fps after lock.
-- [x] **VAD-gate the TX path so the wire bit is real.** Done; we
-  ride on `WebRtcNs_prior_speech_probability` (already linked via
-  the WebRTC_NS vendoring) with a 0.5 probability threshold and a
-  50-frame (500 ms) hold so word-internal pauses don't toggle the
-  bit. Receiver-side win is large: B1 (coord) decode-call count
-  dropped from ~1000/10s to 15-57/10s in a quiet room, since the
-  mixer skips decode on VAD-inactive frames.
-- [ ] **Stop transmitting during silence (actual airtime save).**
-  Phase-1 VAD gating (above) sets the bit correctly but we still TX
-  a packet every superframe — the slot-claim invariant (peer
-  quiet-timeout = `MESH_PEER_QUIET_SFRAMES`) requires it. Real
-  airtime savings need a heartbeat scheme: skip TX while VAD-
-  inactive, send a single keepalive every K superframes. Helps BT
-  Classic coex more than CPU. Tried once and reverted; failure mode
-  to be aware of: with the simple "skip K-1, send 1" loop, the coord
-  side (B1) eventually stopped receiving from the joiner (B2) and
-  declared it dropped, even after bumping `MESH_PEER_QUIET_SFRAMES`
-  for loss margin. The asymmetric break (B1 RX dead, B2 TX healthy,
-  B2 still receiving B1's beacons) wasn't fully explained by the
-  counter math — points at a deeper state-machine interaction once
-  the coord's local view of the slot map shrinks. Worth re-attempting
-  with per-skip diagnostic logs and a smaller initial K (=2 or 3).
-- [ ] **Add Codec2 as a build-time alternate codec behind Kconfig.**
-  Source: `M17-Project/codec2` + `onemikedelta/M17-ESP32` (LX6 proof
-  via `sh123/esp32_loradv`). 8 B/20 ms frames are 5x smaller than
-  our 40 B LC3 — gives loss-tolerance margin and a 6-8-rider
-  fallback. **Needs partition resize first** (99% full). 2-3 days
-  + 1 day A/B speech eval.
+- [x] **VAD-gate the TX path so the wire bit is real.** Done — but it
+  shipped broken and was repaired 2026-06-12: WebRTC_NS only updates
+  `priorSpeechProb` inside `WebRtcNs_Analyze` (AnalyzeCore ->
+  SpeechNoiseProb), which we never called, so the probability sat at
+  its 0.5 init forever and the strictly-greater 0.5 threshold never
+  opened — the intercom was effectively mute from that commit until
+  the fix (the original "decode-count win" was PLC underruns, not
+  VAD). With Analyze+Process per frame the gate works (38-100%
+  active during speech, max prob 88-99%). Analyze-every-frame cost
+  ~4.1 ms and blew the tick budget (~11.5 ms); the shipping config
+  runs Analyze every 2nd frame: NS ~2.6 ms mean / ~7 ms max, tick
+  back at ~10.0-10.15 ms under sustained speech, VAD 54-92% active
+  while talking, drain rates match the VAD duty cycle (~0.9 x
+  100/75). Verified on the bench 2026-06-12 with a talk test —
+  which is the lesson: quiet-room counters alone can't validate
+  anything VAD-shaped.
+- [x] **Stop transmitting during silence (actual airtime save).**
+  Done; `MESH_HEARTBEAT_SFRAMES = 5` in `mesh_mac.c`. Silent joiner
+  slots skip the radio entirely; one header-only frame goes out every
+  5 superframes (100 ms) as a slot-claim keep-alive — half the
+  `MESH_PEER_QUIET_SFRAMES` (10) margin. Coordinators are exempt: the
+  beacon every 40 ms is their keep-alive, so audio-slot silence on
+  the coord is dropped outright (net coord silence airtime = one
+  beacon every 40 ms vs the old two frames every 20 ms). The 2026-06
+  revert root causes (`s_tx_seq` bumping on un-sent, bounded 16-seq
+  replay window, one-shot JOIN) were already repaired by the
+  2026-06-12 review. A 10-s window log emits `tx 10s: audio=… hb=…
+  skip=… (X% silenced)` on each rider. Still needs a two-board soak
+  to confirm coord-loss and peer-left timers stay quiet under
+  sustained silence.
+- [~] **Add Codec2 as a build-time alternate codec behind Kconfig.**
+  Scaffold done; upstream not yet vendored. What's in:
+    - Partition resize: OTA slots 0x1D0000 → 0x1E0000 (`firmware/
+      partitions.csv`); LC3 build is back to 5% free.
+    - Codec abstraction `firmware/main/codec.h` with one API and
+      `CODEC_FRAME_BYTES/SAMPLES/SAMPLE_RATE_HZ/MAX_DECODERS`
+      consumed by every former `codec_lc3.h` call site.
+    - `codec_lc3.c` refactored to implement the new API; old
+      `codec_lc3.h` deleted.
+    - `Kconfig.projbuild` CHOICE `BIKE_CODEC = LC3 | CODEC2`
+      (default LC3); `CMakeLists.txt` picks `codec_lc3.c` or
+      `codec_codec2.c` at configure time.
+    - `codec_codec2.c` stub: codec2 build links cleanly (saves
+      ~115 KB via `--gc-sections` because liblc3 falls out) but
+      `codec_init` aborts with a clear log until upstream lands.
+  What's next (separate diff because it's hundreds of files):
+    - Vendor `drowe67/codec2` at
+      `firmware/components/codec2/upstream/` with a component
+      CMakeLists building only the 3200 bps mode.
+    - Flesh out `codec_codec2.c`: pre-alloc 1x encoder + 8x decoders
+      in internal RAM, buffer two `CODEC_FRAME_SAMPLES` PCM ticks
+      per encode (20 ms), zero-pad the 8 B output into the 40 B
+      wire slot every other tick, return 0 on intermediate ticks.
+    - Measure on the LX6 bench; add a codec2 column to
+      `docs/codec_perf.md` and an A/B speech eval blurb to
+      `docs/build_v0.md`.
 - [ ] **Vendor SpeexDSP** (from `rjsachse/ESP32-SpeexDSP/src/speex/`)
   for AEC + AGC + VAD — pull the C sources, not the Arduino wrapper.
   Matters once helmet speaker bleeds into mic. 3-5 days; DRAM audit

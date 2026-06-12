@@ -6,10 +6,11 @@
 
 /* ---- CRC-16/CCITT-FALSE -----------------------------------------------
  *
- * Bitwise implementation. The mesh covers 66 bytes per frame at 50 Hz,
- * so we're computing ~3.3 KB/s — even on the LX6 the bitwise loop is
- * negligible. If we ever push voice rates up we'll swap in a 256-entry
- * table.
+ * Bitwise implementation. The CRC covers MESH_PROTO_CRC_COVER_BYTES
+ * (86) per frame; at 8 riders x 50 fps that's ~34 KB/s, single-digit
+ * microseconds per packet on the LX6 — negligible, but note it runs
+ * in the wifi task (recv callback). If RX rates ever rise, swap in a
+ * 256-entry table.
  */
 uint16_t mesh_proto_crc16(const uint8_t *data, size_t len)
 {
@@ -29,15 +30,12 @@ uint16_t mesh_proto_crc16(const uint8_t *data, size_t len)
 
 /* ---- Anti-replay ------------------------------------------------------ */
 
-bool mesh_proto_seq_accept(uint16_t last_seq,
-                           uint16_t new_seq,
-                           uint16_t window)
+bool mesh_proto_seq_accept(uint16_t last_seq, uint16_t new_seq)
 {
     /* Treat the 16-bit space as circular: delta is the signed distance
-     * from last_seq to new_seq. Accept iff strictly newer AND within
-     * window. */
-    int16_t delta = (int16_t)(new_seq - last_seq);
-    return delta > 0 && delta <= (int16_t)window;
+     * from last_seq to new_seq. Accept iff strictly newer; any forward
+     * jump is a resync (see header for why there is no upper window). */
+    return (int16_t)(new_seq - last_seq) > 0;
 }
 
 /* ---- Slot map --------------------------------------------------------- */

@@ -1,0 +1,34 @@
+menu "bike_comm"
+
+    choice BIKE_CODEC
+        prompt "Voice codec"
+        default BIKE_CODEC_LC3
+        help
+            Picks the voice codec compiled into the firmware. Both
+            backends share the codec.h API (10 ms / 16 kHz / 40 B wire
+            slot); only one is linked per build. See firmware/main/
+            codec.h for the contract and docs/codec_perf.md for the
+            measured LC3 numbers on LX6. Mesh peers must run matching
+            builds — there is no on-air codec negotiation.
+
+        config BIKE_CODEC_LC3
+            bool "LC3 (google/liblc3, 32 kbps)"
+            help
+                Default. Vendored at firmware/components/liblc3/upstream.
+                Bench-validated; this is what the v0 mesh runs on.
+
+        config BIKE_CODEC_CODEC2
+            bool "Codec2 3200 bps (drowe67/codec2) — STUB"
+            help
+                Build-time alternate for A/B speech eval and a future
+                6-8-rider bandwidth fallback. 8 B per 20 ms padded into
+                the 40 B wire slot every other tick. The upstream
+                drowe67/codec2 source is NOT yet vendored — selecting
+                this option compiles a stub that abort()s in codec_init
+                with a clear log. Use to verify build wiring; do not
+                flash for actual use until the upstream lands at
+                firmware/components/codec2/upstream/ and codec_codec2.c
+                grows past the stub.
+    endchoice
+
+endmenu

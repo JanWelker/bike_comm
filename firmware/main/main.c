@@ -7,9 +7,9 @@
  *   3. BT controller + Bluedroid host
  *   4. Coex tuning (must come after both radios are up)
  *   5. App modules in dependency order:
- *        nvs_cfg -> audio_pipeline -> codec_lc3 -> mixer
- *                                              -> mesh_mac
- *                                              -> bt_classic
+ *        nvs_cfg -> audio_pipeline -> codec -> mixer
+ *                                           -> mesh_mac
+ *                                           -> bt_classic
  *        session_fsm + ui glue everything together
  */
 
@@ -25,7 +25,7 @@
 #include "nvs_flash.h"
 
 #include "audio_pipeline.h"
-#include "codec_lc3.h"
+#include "codec.h"
 #include "mesh_mac.h"
 #include "mixer.h"
 #include "bt_classic.h"
@@ -37,6 +37,9 @@
 #include "freertos/queue.h"
 
 static const char *TAG = "main";
+
+_Static_assert(CODEC_MAX_DECODERS == MESH_MAX_RIDERS,
+               "one codec decoder per mesh rider");
 
 /* Bridge from the ESP-NOW recv callback (wifi task) to the audio_io
  * task via a FreeRTOS queue. Anything the recv callback does itself
@@ -52,7 +55,7 @@ typedef struct {
     bool     vad_active;
     uint16_t seq;                  /* wire seq, fed straight into the JB */
     uint8_t  len;
-    uint8_t  lc3[LC3_FRAME_BYTES];
+    uint8_t  lc3[CODEC_FRAME_BYTES];
 } rx_msg_t;
 
 static QueueHandle_t s_rx_queue = NULL;
@@ -60,8 +63,8 @@ static QueueHandle_t s_rx_queue = NULL;
 static void on_mesh_rx(uint8_t rider_id, uint16_t seq, bool vad_active,
                        const uint8_t *lc3_frame, size_t len)
 {
-    if (rider_id >= 8) return;
-    if (len == 0 || len > LC3_FRAME_BYTES) return;
+    if (rider_id >= MESH_MAX_RIDERS) return;
+    if (len == 0 || len > CODEC_FRAME_BYTES) return;
     if (!s_rx_queue) return;
 
     rx_msg_t msg = { .rider_id = rider_id, .vad_active = vad_active,
@@ -77,12 +80,12 @@ static void on_mesh_rx(uint8_t rider_id, uint16_t seq, bool vad_active,
 void mesh_rx_drain_to_mixer(void)
 {
     rx_msg_t msg;
-    static uint32_t  s_drain_count[8] = {0};
+    static uint32_t  s_drain_count[MESH_MAX_RIDERS] = {0};
     static TickType_t s_last_log_tick = 0;
     while (s_rx_queue && xQueueReceive(s_rx_queue, &msg, 0) == pdTRUE) {
         mixer_push_remote_frame(msg.rider_id, msg.seq,
                                 msg.vad_active, msg.lc3, msg.len);
-        if (msg.rider_id < 8) s_drain_count[msg.rider_id]++;
+        s_drain_count[msg.rider_id]++;
     }
     TickType_t now = xTaskGetTickCount();
     if (now - s_last_log_tick >= pdMS_TO_TICKS(1000)) {
@@ -95,7 +98,24 @@ void mesh_rx_drain_to_mixer(void)
     }
 }
 
+/* Mesh events may be emitted from the ESP-NOW recv callback (wifi
+ * task), which must not log or do FSM work — on_mesh_event only
+ * enqueues; app_main drains the queue and does the real handling. */
+typedef struct {
+    mesh_event_t evt;
+    uint8_t      rider_id;
+} mesh_evt_msg_t;
+
+static QueueHandle_t s_mesh_evt_queue = NULL;
+
 static void on_mesh_event(mesh_event_t evt, uint8_t rider_id)
+{
+    if (!s_mesh_evt_queue) return;
+    mesh_evt_msg_t m = { .evt = evt, .rider_id = rider_id };
+    (void)xQueueSend(s_mesh_evt_queue, &m, 0);
+}
+
+static void handle_mesh_event(mesh_event_t evt, uint8_t rider_id)
 {
     switch (evt) {
     case MESH_EVT_JOINED:           ESP_LOGI(TAG, "mesh: joined at slot %u", rider_id); break;
@@ -105,6 +125,17 @@ static void on_mesh_event(mesh_event_t evt, uint8_t rider_id)
     case MESH_EVT_COORDINATOR_LOST:  ESP_LOGW(TAG, "mesh: coordinator lost"); break;
     case MESH_EVT_COORDINATOR_ME:    ESP_LOGI(TAG, "mesh: we are now coordinator"); break;
     }
+
+    /* A slot changing hands must clear the mixer's per-rider state:
+     * the jitter buffer's last-pulled seq watermark otherwise rejects
+     * the new (or rebooted) occupant's restarted seq numbers for up to
+     * ~5 minutes, and a departed rider would keep its in_use flag and
+     * burn PLC decodes. */
+    if (evt == MESH_EVT_PEER_LEFT || evt == MESH_EVT_PEER_JOINED) {
+        mixer_rider_reset(rider_id);
+    }
+
+    session_fsm_on_mesh(evt, rider_id);
 }
 
 static void platform_init(void)
@@ -155,12 +186,16 @@ void app_main(void)
 
     ESP_ERROR_CHECK(nvs_cfg_init());
     ESP_ERROR_CHECK(audio_pipeline_init());
-    ESP_ERROR_CHECK(codec_lc3_init());
+    ESP_ERROR_CHECK(codec_init());
     ESP_ERROR_CHECK(mixer_init());
 
     uint8_t psk[16];
     ESP_ERROR_CHECK(nvs_cfg_get_psk(psk));
     ESP_ERROR_CHECK(mesh_mac_init(psk));
+    /* Event queue must exist before the callback is registered — events
+     * can fire from the wifi task as soon as frames arrive. */
+    s_mesh_evt_queue = xQueueCreate(8, sizeof(mesh_evt_msg_t));
+    ESP_ERROR_CHECK(s_mesh_evt_queue ? ESP_OK : ESP_ERR_NO_MEM);
     mesh_mac_set_event_cb(on_mesh_event);
     /* Allocate the recv-queue before registering the wifi callback so
      * the very first frame after registration has somewhere to land.
@@ -174,6 +209,11 @@ void app_main(void)
     ESP_ERROR_CHECK(bt_classic_init());
     session_fsm_init();
     ui_init();
+    /* Route BT and button events into the session FSM — without these
+     * wires the arbitration layer (mesh ducking, coex preference) is
+     * dead code and SCO would start without coex_prefer_bt_call(). */
+    bt_classic_set_event_cb(session_fsm_on_bt);
+    ui_set_button_cb(session_fsm_on_button);
 
     /* Start the pipelines. Each module spawns its own FreeRTOS tasks
      * pinned per the plan (audio on Core 1, radio + control on Core 0). */
@@ -188,5 +228,13 @@ void app_main(void)
 
     ESP_LOGI(TAG, "bike_comm ready");
 
-    /* app_main returns; FreeRTOS continues to schedule the tasks. */
+    /* app_main stays alive as the control-plane task: it drains the
+     * deferred mesh events (queued from the wifi/mesh tasks) into the
+     * log and the session FSM. */
+    for (;;) {
+        mesh_evt_msg_t m;
+        if (xQueueReceive(s_mesh_evt_queue, &m, portMAX_DELAY) == pdTRUE) {
+            handle_mesh_event(m.evt, m.rider_id);
+        }
+    }
 }

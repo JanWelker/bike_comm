@@ -11,6 +11,7 @@
 #include "mesh_mac.h"
 #include "coex.h"
 #include "ui.h"
+#include "audio_pipeline.h"
 
 #include "esp_log.h"
 
@@ -18,12 +19,8 @@ static const char *TAG = "session";
 
 static session_mode_t s_mode = SESSION_IDLE;
 
-static void enter(session_mode_t next)
+static void apply_mode(session_mode_t next)
 {
-    if (next == s_mode) return;
-    ESP_LOGI(TAG, "%d -> %d", s_mode, next);
-    s_mode = next;
-
     switch (next) {
     case SESSION_IDLE:
         ui_set_led(LED_IDLE);
@@ -51,9 +48,21 @@ static void enter(session_mode_t next)
     }
 }
 
+static void enter(session_mode_t next)
+{
+    if (next == s_mode) return;
+    ESP_LOGI(TAG, "%d -> %d", s_mode, next);
+    s_mode = next;
+    apply_mode(next);
+}
+
 void session_fsm_init(void)
 {
-    enter(SESSION_IDLE);
+    /* Apply the IDLE side effects unconditionally — s_mode already
+     * equals SESSION_IDLE, so enter() would no-op and the initial LED
+     * state / coex preference would never be set. */
+    s_mode = SESSION_IDLE;
+    apply_mode(SESSION_IDLE);
 }
 
 session_mode_t session_fsm_get_mode(void) { return s_mode; }
@@ -70,6 +79,12 @@ void session_fsm_on_button(button_event_t evt)
         break;
     case BTN_EVT_MODE_LONG:
         bt_classic_end_call();
+        break;
+    case BTN_EVT_VOL_UP:
+        audio_pipeline_vol_step(+5);
+        break;
+    case BTN_EVT_VOL_DOWN:
+        audio_pipeline_vol_step(-5);
         break;
     case BTN_EVT_ALL_HELD:
         /* Long combo: reset pairing / regenerate group PSK. */

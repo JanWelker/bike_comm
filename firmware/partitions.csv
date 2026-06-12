@@ -1,12 +1,16 @@
 # ESP32 with 4 MB flash, OTA-ready.
-# OTA partitions sized 0x1D0000 (1.875 MB each) — bumped from 0x1C0000 to
-# absorb WebRTC_NS (cpuimage/WebRTC_NS) when noise suppression landed.
+# OTA partitions sized 0x1E0000 (1.9375 MB each) — bumped from 0x1D0000 to
+# carve out headroom for the codec2 build-time alternate (a Kconfig CHOICE
+# at firmware/main/Kconfig.projbuild). The LC3 build still has plenty of
+# slack; the resize is preemptive so the codec2 vendoring step doesn't
+# also have to rearrange partitions.
+# Previous step (2026-06): 0x1C0000 → 0x1D0000 to absorb WebRTC_NS.
 # Room taken from the otherwise-unused spiffs storage partition.
 # Name,   Type, SubType,  Offset,   Size,    Flags
 nvs,      data, nvs,      0x9000,   0x6000,
 otadata,  data, ota,      0xf000,   0x2000,
 phy_init, data, phy,      0x11000,  0x1000,
-ota_0,    app,  ota_0,    0x20000,  0x1D0000,
-ota_1,    app,  ota_1,    0x1F0000, 0x1D0000,
-nvs_keys, data, nvs_keys, 0x3C0000, 0x1000, encrypted
-storage,  data, spiffs,   0x3C1000, 0x3F000,
+ota_0,    app,  ota_0,    0x20000,  0x1E0000,
+ota_1,    app,  ota_1,    0x200000, 0x1E0000,
+nvs_keys, data, nvs_keys, 0x3E0000, 0x1000, encrypted
+storage,  data, spiffs,   0x3E1000, 0x1F000,

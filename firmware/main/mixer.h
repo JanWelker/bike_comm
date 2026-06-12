@@ -31,7 +31,7 @@ esp_err_t mixer_init(void);
  *                 active. When false, the mixer skips LC3 decode for
  *                 this slot (treats it as silence) to save CPU.
  *   lc3         — payload bytes
- *   len         — payload length (expected = LC3_FRAME_BYTES = 40)
+ *   len         — payload length (expected = CODEC_FRAME_BYTES = 40)
  *
  * NOTE: signature changed in v0.x — was `(rider_id, lc3, len)`. The
  * mesh RX callback in mesh_mac must pass seq + vad through. */
@@ -44,18 +44,21 @@ void mixer_push_remote_frame(uint8_t rider_id,
 /* Push PCM audio from the phone path (HFP RX or A2DP). */
 void mixer_push_phone_pcm(const int16_t pcm[MIXER_PCM_SAMPLES]);
 
+/* Reset one rider's mixer state: clears the jitter buffer (including
+ * its last-pulled seq watermark) and the in_use flag. Call on
+ * MESH_EVT_PEER_LEFT / MESH_EVT_PEER_JOINED so (a) a departed rider
+ * stops costing a PLC decode per tick and (b) a rebooted rider's fresh
+ * seq numbers aren't rejected against the pre-reboot watermark. */
+void mixer_rider_reset(uint8_t rider_id);
+
 /* Pull the next mixed 10 ms frame.
  *
  * `speaker` is the signal that goes to the codec.
- * `aec_ref` is the reference fed into ESP-SR AFE.
- *
- * For v0 both buffers receive the same data (the speaker output IS the
- * AEC reference). Delay compensation is a v0.5 AEC-tuning concern. */
+ * `aec_ref`, when non-NULL, receives the same samples as the future
+ * AEC reference (SpeexDSP AEC is v0.5 work; pass NULL until a consumer
+ * exists). Delay compensation is a v0.5 AEC-tuning concern. */
 void mixer_pull(int16_t speaker[MIXER_PCM_SAMPLES],
                 int16_t aec_ref[MIXER_PCM_SAMPLES]);
-
-/* Backward-compat wrapper around mixer_pull that discards the ref. */
-void mixer_pull_speaker_frame(int16_t out[MIXER_PCM_SAMPLES]);
 
 /* Set the duck attenuation applied to mesh streams when a phone call
  * is in progress. Argument is positive dB of attenuation (0 = no duck,

@@ -21,7 +21,11 @@
 #define MESH_PROTO_LC3_BYTES          40
 #define MESH_PROTO_FRAME_BYTES        88          /* full on-air frame   */
 #define MESH_PROTO_CRC_COVER_BYTES    86          /* bytes 0..85         */
-#define MESH_PROTO_REPLAY_WINDOW      16          /* 2 superframes worth */
+
+/* Beacons carry the low 3 bytes of each claimed slot's MAC so riders
+ * can detect a stolen or double-allocated slot (not just a cleared
+ * bit). 3 bytes is plenty for collision odds across <= 8 riders. */
+#define MESH_PROTO_OWNER_BYTES        3
 
 /* Flags bitfield (mirrors mesh_mac.h; defined here so host tests don't
  * need to include the ESP-IDF header). */
@@ -64,10 +68,19 @@ _Static_assert(sizeof(mesh_frame_t) == MESH_PROTO_FRAME_BYTES,
 typedef struct __attribute__((packed)) {
     uint8_t  magic;                               /* MESH_PROTO_BEACON_MAGIC */
     uint32_t coord_mac_low;                       /* lowest 4 B of coord MAC */
-    uint32_t us_timestamp;                        /* coord esp_timer mod 2^32 */
+    uint32_t us_timestamp;                        /* mesh time of this
+                                                     superframe's slot-0
+                                                     boundary, mod 2^32 —
+                                                     doubles as clock-sync
+                                                     reference and slot-grid
+                                                     phase anchor           */
     uint8_t  slot_map;                            /* bit i = slot i claimed   */
     uint8_t  group_version;                       /* bumped on PSK/schema     */
-    uint8_t  reserved[29];                        /* zeros, future use        */
+    uint8_t  slot_owner[MESH_PROTO_MAX_RIDERS][MESH_PROTO_OWNER_BYTES];
+                                                  /* low 3 B of owner MAC per
+                                                     claimed slot, 0 if free /
+                                                     unknown (big-endian)     */
+    uint8_t  reserved[5];                         /* zeros, future use        */
 } mesh_beacon_t;
 
 _Static_assert(sizeof(mesh_beacon_t) == MESH_PROTO_LC3_BYTES,
@@ -79,18 +92,19 @@ uint16_t mesh_proto_crc16(const uint8_t *data, size_t len);
 
 /* ---- Anti-replay ----
  *
- * Accept new_seq iff it is strictly newer than last_seq and within
- * `window` of it, in 16-bit modular arithmetic. The first frame from a
- * rider (signaled by caller initialising last_seq = new_seq - 1 or by
- * separate first-seen bookkeeping) is the caller's responsibility — we
- * keep this function pure.
+ * Accept new_seq iff it is strictly newer than last_seq in 16-bit
+ * modular arithmetic: delta = (int16_t)(new_seq - last_seq) > 0.
  *
- * Concretely: delta = (int16_t)(new_seq - last_seq); accept iff
- * 0 < delta <= window.
+ * Forward jumps of any size are accepted as a resync. A bounded
+ * forward window looks safer but is a liveness trap: a TX gap longer
+ * than the window (RF fade, future TX-skip heartbeats) makes the
+ * first frame after the gap land outside it, and since the gap only
+ * grows from there every later frame is rejected too — the receiver
+ * stays deaf until the quiet-timeout tears the peer down. Replayed
+ * recordings still fail (their seq is <= last seen). The first frame
+ * from a rider (no last_seq yet) is the caller's responsibility.
  */
-bool mesh_proto_seq_accept(uint16_t last_seq,
-                           uint16_t new_seq,
-                           uint16_t window);
+bool mesh_proto_seq_accept(uint16_t last_seq, uint16_t new_seq);
 
 /* ---- Slot map ---- */
 
