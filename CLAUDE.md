@@ -48,6 +48,9 @@ mesh_proto layout-size assertion has caught silent rot before.
 | `firmware/main/codec_lc3.c` | liblc3 wrapper, pre-allocated encoder + 8 decoders |
 | `firmware/main/mixer.c`, `mixer_jb.c` | Per-rider jitter buffer + summing mixer |
 | `firmware/main/coex.c` | Wi-Fi + BT coexistence tuning (single-radio risk lives here) |
+| `firmware/main/bt_classic.c` | Bluedroid GAP + HFP-HF control plane: SSP Just Works, COD wearable headset, SLC + call state machine, persists phone BDA in nvs_cfg, exposes `bt_classic_external_emit` for sibling modules |
+| `firmware/main/bt_audio.c` | HFP-HF SCO data plane: PSRAM ring buffers, mSBC 7.5 ms cadence bridged to the 10 ms audio_io tick. RX cb in BTC task, drain in loopback_task on Core 1 |
+| `firmware/main/bt_a2dp.c` | A2DP-sink + AVRCP-CT: legacy PCM cb (Bluedroid does SBC decode), 48k SEP only, stereo->mono + 3:1 box-filter decimate to 16 kHz, PSRAM ring, drained into mixer alongside SCO |
 | `firmware/components/liblc3/upstream/` | Vendored google/liblc3 v1.1.1 |
 | `docs/architecture.md` | Block diagram, layer map, CPU budget |
 | `docs/mesh_protocol.md` | Wire format, slot math, beacon, failover |
@@ -84,6 +87,47 @@ mesh_proto layout-size assertion has caught silent rot before.
   starves `mesh_mac_start` of internal RAM. 7168 sits right on the
   cliff — any new BSS or large managed component that grabs DRAM
   tips us over.
+- **`mesh_mac_start` must be called BEFORE `audio_pipeline_start` in
+  `app_main`.** Both task stacks need a contiguous internal-DRAM
+  block (audio_io's 7 KB is the larger one). If audio goes first it
+  takes the biggest hole and `mesh_mac_start` later aborts with
+  `ESP_ERR_NO_MEM`. With mesh first, the smaller mesh_tx_task fits in
+  a smaller hole and audio_io still has a 7 KB block. The audio task's
+  callbacks (`mesh_rx_drain`, `bt_audio_sco_pull_to_mixer`,
+  `bt_a2dp_drain_to_mixer`) are safe to call before their producers
+  are live — they're ring-buffer reads that no-op when empty.
+- **`audio_pipeline_start` returns `esp_err_t`; `ESP_ERROR_CHECK` it
+  in `app_main`.** It was originally `void` and a silent
+  `xTaskCreate` failure for the loopback task once shipped a board
+  that mesh'd heartbeats fine but had zero audio (Stage 3 SCO showed
+  `rx=0 tx=0` for the whole call). The wrapper now logs free/largest
+  internal-DRAM blocks on failure so the diagnosis is in the panic.
+- **BT controller mode is `BR_EDR_ONLY` at Kconfig (not BTDM).**
+  `CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y` in `sdkconfig.defaults`. We
+  don't use BLE; BR_EDR-only excludes the BLE stack from the build
+  entirely and saves real internal DRAM on the LX6. `platform_init`
+  calls `esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT)` — the
+  enable mode MUST equal the init mode on the ESP32, so flipping
+  this Kconfig and the enable call together is mandatory or boot
+  aborts at the controller_enable. Caveat: editing
+  `sdkconfig.defaults` does NOT update an existing `sdkconfig` —
+  that file is the cached working copy. Either `rm sdkconfig &&
+  idf.py build` or edit `sdkconfig` directly.
+- **SCO + A2DP ring buffers live in PSRAM, not the internal heap.**
+  `xRingbufferCreateStatic` with storage from
+  `heap_caps_malloc(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)`. The
+  default `xRingbufferCreate` would land in internal DRAM and tip
+  the 7 KB audio_io stack cliff (Stage 3 bug). The 240 B / 320 B
+  transfers at <200 Hz cost negligible PSRAM bandwidth. ISR access
+  is NOT used (BTC task + Core 1 audio task only), which is the
+  safety constraint. `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384`
+  does NOT override explicit `MALLOC_CAP_SPIRAM` allocations — it
+  only redirects generic `malloc()`.
+- **`CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH=y` +
+  `CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y` are load-bearing.**
+  Without them, adding `bt_audio.c`'s ring buffer use blew IRAM by
+  ~2.3 KB. Moving these to flash recovered ~11 KB of IRAM and is
+  the headroom that lets Stage 5 (A2DP) and future SpeexDSP land.
 - **The ESP-NOW recv callback cannot block or allocate.** It runs in
   the wifi task. `heap_caps_malloc` inside the callback (even
   transitively, via lazy codec decoder acquisition) stalls Wi-Fi and
@@ -342,10 +386,60 @@ dir.
       buffers stay in PSRAM.
     - Add a codec2 column to `docs/codec_perf.md` once the LX6
       numbers are within budget.
+- [x] **Phone link: HFP-HF Stage 1 + 2 (pair + control plane).**
+  Bench-validated 2026-06-12. `bt_classic.{c,h}` brings up Bluedroid
+  GAP + HFP-HF. SSP Just Works (IO cap `NoInputNoOutput`), Class of
+  Device 0x240404 (Audio service + Audio/Video major + Wearable
+  Headset minor → phones render us as a headset). On first boot the
+  scan mode is `CONNECTABLE | GENERAL_DISCOVERABLE`; subsequent boots
+  read the persisted phone BDA from `nvs_cfg/paired_phone_addr` and
+  go connectable-only + proactively `esp_hf_client_connect`. AT/+CIEV
+  CALL and CALL_SETUP indicators drive a state machine emitting
+  `BT_EVT_INCOMING_CALL` / `CALL_ESTABLISHED` / `CALL_ENDED` into
+  `session_fsm`. Verified on the bench: pair, SLC up (peer_feat
+  0xfef includes mSBC codec negotiation), incoming-call ring
+  transition, MESH_ONLY → PHONE_CALL_WITH_MESH on answer, mesh ducks
+  -12 dB, `coex_prefer_bt_call()` fires.
+- [~] **Phone link: HFP-HF Stage 3 (SCO audio over mSBC).** Code
+  complete; bench result 2026-06-12 showed rx=0 tx=0 stats after a
+  real call. Root cause was `audio_pipeline_start` returning `void`
+  and the loopback task's `xTaskCreate` failing silently after the
+  init-order reorder consumed the largest internal-DRAM block.
+  Two fixes in: (a) SCO ring buffers moved to PSRAM via
+  `xRingbufferCreateStatic` + `heap_caps_malloc(MALLOC_CAP_SPIRAM)`,
+  freeing ~3.8 KB internal DRAM; (b) `audio_pipeline_start` now
+  returns `esp_err_t` and `app_main` `ESP_ERROR_CHECK`s it (with
+  free/largest-block heap state in the panic log). Awaiting bench
+  re-verification — should now show non-zero rx/tx and audible
+  duplex on the bench.
+- [x] **Phone link: A2DP-sink + AVRCP-CT (Stage 5).** Code complete
+  2026-06-12, awaiting bench. `bt_a2dp.{c,h}`: legacy PCM data cb
+  (Bluedroid decodes SBC internally — avoids vendoring an SBC
+  decoder), only 48 kHz negotiated, stereo->mono mix + 3-tap box-
+  filter 3:1 decimate to 16 kHz, PSRAM-backed 1-second ring buffer,
+  drained into `mixer_push_phone_pcm` from the audio_io tick
+  alongside the SCO path (mutually exclusive via session_fsm).
+  AVRCP-CT registered with a logging callback; sending passthrough
+  commands waits on `ui.c` growing button events. Box-filter
+  decimator is intentionally crude (~13 dB stopband) — adequate for
+  helmet ride music but the Hamming-sinc upgrade is queued behind
+  SpeexDSP.
+- [ ] **Phone link: 2-board mesh + phone coex soak (Stage 4).**
+  Bench procedure: flash both boards, pair phone with board A, both
+  boards meshed. Run a 5-minute test call on board A while board B
+  is the silent mesh peer. Watch board B's logs for any `mesh:
+  coordinator lost`, `mesh: peer left at slot N`, or rx-drain rate
+  dropping below ~70 fps. Expected: ~100/75 fps drain stays;
+  -12 dB mesh duck on board A while in call; mesh recovers cleanly
+  when the call ends. This is the data point Espressif coex.html
+  asks for; if drains hold under sustained SCO, Bluedroid stays
+  the default and we close the BTstack-vs-Bluedroid roadmap item.
 - [ ] **Vendor SpeexDSP** (from `rjsachse/ESP32-SpeexDSP/src/speex/`)
   for AEC + AGC + VAD — pull the C sources, not the Arduino wrapper.
   Matters once helmet speaker bleeds into mic. 3-5 days; DRAM audit
-  first.
+  first. Side benefit: SpeexDSP ships a high-quality polyphase
+  resampler we can drop into `bt_a2dp.c` to retire the box-filter
+  decimator.
 - [ ] **Bookmark `tanakamasayuki/PCMFlowG722`** as a Plan-B wideband
   codec (~10 KB flash, ~512 B RAM, but 64 kbps wire cost is 2x our
   LC3 — bad for the 8-slot frame). 0 effort; don't migrate.

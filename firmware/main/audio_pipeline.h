@@ -28,7 +28,12 @@
 #define AUDIO_FRAME_SAMPLES  160   /* 10 ms @ 16 kHz */
 
 esp_err_t audio_pipeline_init(void);
-void      audio_pipeline_start(void);
+/* Returns ESP_OK on success, ESP_ERR_NO_MEM if the loopback task can't
+ * spawn (most likely cause: internal DRAM exhausted by other modules
+ * grabbing their task stacks first). app_main ESP_ERROR_CHECKs this so
+ * a silent failure surfaces as a panic with the heap state logged
+ * instead of a board that ships heartbeats but no audio. */
+esp_err_t audio_pipeline_start(void);
 
 /* Speaker output volume, in percent (0..100). Initial value is 100,
  * set in audio_pipeline_start(). vol_step adds delta_pct, clamps into

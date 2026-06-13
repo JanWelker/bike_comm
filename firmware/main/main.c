@@ -17,6 +17,7 @@
 #include <string.h>
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
@@ -29,6 +30,8 @@
 #include "mesh_mac.h"
 #include "mixer.h"
 #include "bt_classic.h"
+#include "bt_audio.h"
+#include "bt_a2dp.h"
 #include "session_fsm.h"
 #include "ui.h"
 #include "nvs_cfg.h"
@@ -170,9 +173,13 @@ static void platform_init(void)
         abort();
     }
 
+    /* Controller mode is CLASSIC_BT only — sdkconfig sets
+     * CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y so the BLE controller is not
+     * even built in. Don't try to enable BTDM here: it would fail
+     * controller_enable() against a BR/EDR-only image. */
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
-    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BTDM));
+    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT));
     ESP_ERROR_CHECK(esp_bluedroid_init());
     ESP_ERROR_CHECK(esp_bluedroid_enable());
 }
@@ -206,7 +213,23 @@ void app_main(void)
     ESP_ERROR_CHECK(s_rx_queue ? ESP_OK : ESP_ERR_NO_MEM);
     mesh_mac_set_rx_cb(on_mesh_rx);
 
+    /* Order matters here. bt_classic_init runs esp_hf_client_init which
+     * resets HF-client internal state including any previously-registered
+     * data callback. So we MUST register the audio data callback (in
+     * bt_audio_init) AFTER esp_hf_client_init returns. The AUDIO_STATE
+     * event can't fire before a phone connects, so the bt_classic_init →
+     * bt_audio_init order is race-free in practice. (Earlier we ran
+     * bt_audio_init first and Stage 3 SCO showed rx=0 tx=0 — that order
+     * left the data cb unregistered, which is the leading hypothesis.) */
+    ESP_LOGI(TAG, "free DRAM pre-BT: internal=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     ESP_ERROR_CHECK(bt_classic_init());
+    ESP_ERROR_CHECK(bt_audio_init());
+    ESP_ERROR_CHECK(bt_a2dp_init());
+    ESP_LOGI(TAG, "free DRAM post-BT: internal=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     session_fsm_init();
     ui_init();
     /* Route BT and button events into the session FSM — without these
@@ -216,9 +239,24 @@ void app_main(void)
     ui_set_button_cb(session_fsm_on_button);
 
     /* Start the pipelines. Each module spawns its own FreeRTOS tasks
-     * pinned per the plan (audio on Core 1, radio + control on Core 0). */
-    audio_pipeline_start();
+     * pinned per the plan (audio on Core 1, radio + control on Core 0).
+     *
+     * Order matters: mesh_mac_start FIRST. The audio_io task takes 7 KB
+     * of internal DRAM for its stack (per the CLAUDE.md gotcha), and the
+     * BT-Classic + bt_audio ring buffers have already eaten ~4 KB.
+     * Spawning audio_pipeline first leaves the largest contiguous block
+     * for mesh_tx_task too small, and mesh_mac_start aborts with
+     * ESP_ERR_NO_MEM. The audio task's callbacks (mesh_rx_drain,
+     * bt_audio taps) are safe to call before their producers are live —
+     * they're queue / ring-buffer reads that no-op when empty. */
     ESP_ERROR_CHECK(mesh_mac_start());
+    ESP_LOGI(TAG, "free DRAM post-mesh: internal=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    ESP_ERROR_CHECK(audio_pipeline_start());
+    ESP_LOGI(TAG, "free DRAM post-audio: internal=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     uint8_t slot;
     esp_err_t join_err = mesh_mac_join(&slot);

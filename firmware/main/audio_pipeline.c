@@ -77,6 +77,8 @@
 #include "codec.h"
 #include "mesh_mac.h"
 #include "mixer.h"
+#include "bt_audio.h"
+#include "bt_a2dp.h"
 
 /* Implemented in main.c: drains the wifi-RX-to-mixer queue. Declared
  * here as extern so the audio_io task can drive it on every tick. */
@@ -228,16 +230,18 @@ esp_err_t audio_pipeline_init(void)
     return ESP_OK;
 }
 
-void audio_pipeline_start(void)
+esp_err_t audio_pipeline_start(void)
 {
     if (s_running) {
         ESP_LOGW(TAG, "already running");
-        return;
+        return ESP_OK;
     }
 
     /* Bring up the data path before the codec drivers start clocking it. */
-    ESP_ERROR_CHECK(i2s_channel_enable(s_spk_tx_chan));
-    ESP_ERROR_CHECK(i2s_channel_enable(s_mic_rx_chan));
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_spk_tx_chan),
+                        TAG, "spk i2s enable");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_mic_rx_chan),
+                        TAG, "mic i2s enable");
 
     /* Open both codec devices at the same sample format. */
     esp_codec_dev_sample_info_t fs = {
@@ -250,7 +254,7 @@ void audio_pipeline_start(void)
     int rc = esp_codec_dev_open(s_spk_dev, &fs);
     if (rc != ESP_CODEC_DEV_OK) {
         ESP_LOGE(TAG, "spk codec open failed: %d", rc);
-        return;
+        return ESP_FAIL;
     }
     /* For the mic read we want STEREO frames so the I2S RX delivers
      * just the right slot (where ES7243 puts AINRP/AINRN). */
@@ -260,7 +264,7 @@ void audio_pipeline_start(void)
     rc = esp_codec_dev_open(s_mic_dev, &mic_fs);
     if (rc != ESP_CODEC_DEV_OK) {
         ESP_LOGE(TAG, "mic codec open failed: %d", rc);
-        return;
+        return ESP_FAIL;
     }
 
     /* Volume + gain tuned for v0 bench loopback. Mic at 33 dB stays
@@ -326,11 +330,16 @@ void audio_pipeline_start(void)
                                             LOOPBACK_TASK_PRIO, NULL,
                                             AUDIO_CORE);
     if (ok != pdPASS) {
-        ESP_LOGE(TAG, "loopback task create failed");
+        ESP_LOGE(TAG, "loopback task create failed — internal DRAM exhausted "
+                      "(stack=%lu); free internal=%u, largest block=%u",
+                 (unsigned long)LOOPBACK_STACK,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         s_running = false;
-    } else {
-        ESP_LOGI(TAG, "loopback task running on core %d", AUDIO_CORE);
+        return ESP_ERR_NO_MEM;
     }
+    ESP_LOGI(TAG, "loopback task running on core %d", AUDIO_CORE);
+    return ESP_OK;
 }
 
 void audio_pipeline_vol_step(int delta_pct)
@@ -661,6 +670,11 @@ static void loopback_task(void *arg)
         if (ns_dt > s_ns_us_max) s_ns_us_max = ns_dt;
         s_ns_count++;
 
+        /* SCO TX: feed post-NS mic to the phone regardless of VAD.
+         * Silence during a call must still travel as silence — freezing
+         * a frame would sound like a hung call. No-op when SCO is down. */
+        bt_audio_sco_push_mic(buf);
+
         /* VAD via WebRTC NS's internal speech probability + hold. */
         float speech_prob = WebRtcNs_prior_speech_probability(s_ns);
         if (speech_prob > s_vad_prob_max) s_vad_prob_max = speech_prob;
@@ -686,6 +700,12 @@ static void loopback_task(void *arg)
             mesh_mac_queue_tx(lc3_buf, true);
         }
         mesh_rx_drain_to_mixer();
+        /* Phone audio in: either SCO (call) or A2DP (music). The two
+         * paths are mutually exclusive via session_fsm + the BT stack
+         * (no SCO and A2DP at once), so calling both is safe — one
+         * no-ops based on its own active flag. */
+        bt_audio_sco_pull_to_mixer();
+        bt_a2dp_drain_to_mixer();
 
         mixer_pull(spk_buf, NULL /* aec_ref: no consumer until v0.5 AEC */);
 #if AUDIO_DIAG_MIC_LEVEL

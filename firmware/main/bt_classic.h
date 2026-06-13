@@ -44,6 +44,17 @@ esp_err_t bt_classic_pair(uint16_t seconds);
 esp_err_t bt_classic_answer_call(void);
 esp_err_t bt_classic_end_call(void);
 
+/* Forget the currently-paired phone (NVS + Bluedroid bond cache) and
+ * return to discoverable. Bound to the ALL_HELD button combo in the
+ * session FSM. */
+esp_err_t bt_classic_forget_phone(void);
+
 bt_state_t bt_classic_get_state(void);
 
 void       bt_classic_set_event_cb(bt_event_cb_t cb);
+
+/* Push a BT event into the registered listener (the session FSM in
+ * normal builds). Called by sibling modules — bt_a2dp.c uses this to
+ * feed A2DP_START / A2DP_STOP / CONNECTED through the same emit chain
+ * as the HFP path, so session_fsm doesn't need a parallel hookup. */
+void       bt_classic_external_emit(bt_event_t evt);

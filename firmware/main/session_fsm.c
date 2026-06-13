@@ -87,7 +87,10 @@ void session_fsm_on_button(button_event_t evt)
         audio_pipeline_vol_step(-5);
         break;
     case BTN_EVT_ALL_HELD:
-        /* Long combo: reset pairing / regenerate group PSK. */
+        /* Long combo: forget the paired phone and become discoverable
+         * again. Mesh PSK regen lives on the same combo but is gated
+         * on a longer hold (TODO when ui.c grows hold-time variants). */
+        bt_classic_forget_phone();
         break;
     default:
         break;
@@ -98,8 +101,20 @@ void session_fsm_on_bt(bt_event_t evt)
 {
     switch (evt) {
     case BT_EVT_CONNECTED:
-        enter((s_mode == SESSION_MESH_ONLY) ?
-              SESSION_PHONE_CALL_WITH_MESH : SESSION_IDLE);
+        /* HFP SLC up — phone is paired and reachable. Don't change
+         * mode; PHONE_CALL is reserved for an actual active call.
+         * Previously this transitioned straight into PHONE_CALL on
+         * profile connect, which then ducked the mesh -12 dB whenever
+         * the phone simply came in range. */
+        break;
+    case BT_EVT_DISCONNECTED:
+        /* Phone went out of range or was forgotten. If we were stuck
+         * in any phone-call state (e.g. CIND updates never arrived
+         * before the link died), fall back gracefully. */
+        if (s_mode == SESSION_PHONE_CALL ||
+            s_mode == SESSION_A2DP_ONLY)            enter(SESSION_IDLE);
+        if (s_mode == SESSION_PHONE_CALL_WITH_MESH ||
+            s_mode == SESSION_A2DP_WITH_MESH)       enter(SESSION_MESH_ONLY);
         break;
     case BT_EVT_INCOMING_CALL:
         /* UI flashes; user presses MODE_SHORT to accept. */
