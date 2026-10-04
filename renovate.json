@@ -1,16 +1,12 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended",
-    ":dependencyDashboard",
+    "github>JanWelker/renovate-config",
     ":semanticCommitTypeAll(deps)"
   ],
-  "labels": ["dependencies"],
-  "timezone": "Europe/Zurich",
+  "description": "No CI runs on pull requests here, so nothing merges on its own. ESP-IDF and liblc3 bumps need a re-flash and a retest.",
   "schedule": ["before 4am on monday"],
   "minimumReleaseAge": "7 days",
-  "prHourlyLimit": 4,
-  "prConcurrentLimit": 8,
   "automerge": false,
   "customManagers": [
     {
@@ -27,9 +23,7 @@
     {
       "customType": "regex",
       "description": "liblc3 git tag pinned in the vendoring notes",
-      "managerFilePatterns": [
-        "/^firmware/components/liblc3/VENDORING\\.md$/"
-      ],
+      "managerFilePatterns": ["/^firmware/components/liblc3/VENDORING\\.md$/"],
       "matchStrings": [
         "liblc3 \\*\\*(?<currentValue>v[0-9.]+)\\*\\*",
         "google/liblc3\\.git (?<currentValue>v[0-9.]+) --squash"
@@ -52,10 +46,16 @@
       "groupName": "liblc3"
     },
     {
-      "description": "Major bumps always go through the dashboard for explicit approval.",
-      "matchUpdateTypes": ["major"],
-      "addLabels": ["major-bump"],
-      "dependencyDashboardApproval": true
+      "description": "No CI, so the preset's automerge below major is off too.",
+      "matchUpdateTypes": [
+        "patch",
+        "minor",
+        "digest",
+        "pin",
+        "pinDigest",
+        "lockFileMaintenance"
+      ],
+      "automerge": false
     }
   ]
 }
