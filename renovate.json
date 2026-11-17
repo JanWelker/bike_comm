@@ -8,6 +8,17 @@
   "schedule": ["before 4am on monday"],
   "minimumReleaseAge": "7 days",
   "automerge": false,
+  "ignorePaths": [
+    "**/node_modules/**",
+    "**/bower_components/**",
+    "**/vendor/**",
+    "**/examples/**",
+    "**/__tests__/**",
+    "**/test/**",
+    "**/tests/**",
+    "**/__fixtures__/**",
+    "firmware/components/*/upstream/**"
+  ],
   "customManagers": [
     {
       "customType": "regex",
